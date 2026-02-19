@@ -1,0 +1,17 @@
+node_modules
+.git
+.expo
+dist
+web-build
+.vercel
+*.log
+*.local
+.env
+.env.*
+!/.env.example
+assets
+src
+App.tsx
+index.ts
+android
+ios

@@ -1,0 +1,16 @@
+FROM node:20-alpine
+
+ENV NODE_ENV=production
+
+WORKDIR /app
+
+# Install only backend runtime deps to keep image small and fast to build.
+COPY server/package.json ./package.json
+RUN npm install --omit=dev --no-audit --no-fund
+
+COPY server/index.js ./server/index.js
+
+WORKDIR /app/server
+EXPOSE 8787
+
+CMD ["node", "index.js"]
