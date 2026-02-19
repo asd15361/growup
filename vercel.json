@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/[...all].js": {
+      "maxDuration": 60
+    }
+  }
+}

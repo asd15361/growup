@@ -13,18 +13,37 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.tianboasd.growup"
     },
     "android": {
+      "package": "com.tianboasd.growup",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-font",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow GrowUp to access your photos for AI image understanding."
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "69792e39-2ff8-4b04-8fcf-437bcd5cef44"
+      }
     }
   }
 }
