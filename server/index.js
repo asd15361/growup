@@ -55,6 +55,15 @@ function getBearerToken(req) {
   return header.slice(7).trim();
 }
 
+function isInternalRecapPrompt(message) {
+  const text = typeof message === 'string' ? message.replace(/\s+/g, ' ').trim() : '';
+  return text.startsWith('请根据以下聊天记录生成')
+    && text.includes('仅返回 JSON')
+    && text.includes('"summary"')
+    && text.includes('"important"')
+    && text.includes('"todo"');
+}
+
 function stripUser(record) {
   if (!record) return null;
   return {
@@ -730,6 +739,9 @@ app.post('/api/chat', async (req, res) => {
     }
     if (imageDataUrl && !imageDataUrl.startsWith('data:image/')) {
       return res.status(400).json({ error: 'imageDataUrl must be data:image/* base64' });
+    }
+    if (isInternalRecapPrompt(message)) {
+      return res.status(400).json({ error: 'internal recap prompt is not allowed on chat endpoint' });
     }
 
     const payloadForModel = {
