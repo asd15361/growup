@@ -35,9 +35,12 @@ const POCKETBASE_TIMEOUT_MS = Number(process.env.POCKETBASE_TIMEOUT_MS || 15000)
 const PB_URL = (process.env.POCKETBASE_URL_NEW || process.env.POCKETBASE_URL || '').trim();
 const PB_USERS_COLLECTION = (process.env.POCKETBASE_USERS_COLLECTION || 'users').trim();
 const PB_CHAT_COLLECTION = (process.env.POCKETBASE_CHAT_COLLECTION || 'chat_messages').trim();
+const PB_MEMORIES_COLLECTION = (process.env.POCKETBASE_MEMORIES_COLLECTION || 'memories').trim();
 const IDENTITY_PREFIX = '__identity__::';
 const STATE_PREFIX = '__app_state__::';
 const STATE_MODEL = 'state-v1';
+const MEMORY_KIND_IDENTITY = 'identity-v1';
+const MEMORY_KIND_STATE = 'state-v1';
 
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
@@ -233,7 +236,66 @@ function textToState(text) {
   }
 }
 
-async function findStateRecord(pb, userId) {
+function pbErrorMessage(error) {
+  return String(error?.response?.message || error?.message || '').trim();
+}
+
+function isMissingCollectionError(error) {
+  const message = pbErrorMessage(error).toLowerCase();
+  return message.includes('collection') && (message.includes('not found') || message.includes('missing'));
+}
+
+function isFilterFieldError(error) {
+  const message = pbErrorMessage(error).toLowerCase();
+  return message.includes('filter') && (message.includes('invalid') || message.includes('unknown') || message.includes('failed'));
+}
+
+function isRecoverableMemoryWriteError(error) {
+  const message = pbErrorMessage(error).toLowerCase();
+  return message.includes('field')
+    || message.includes('validation')
+    || message.includes('required')
+    || message.includes('relation')
+    || message.includes('schema');
+}
+
+function memoryPayloadFromRecord(record, legacyParser) {
+  const candidates = [
+    record?.content_json,
+    record?.contentJson,
+    record?.content,
+    record?.payload,
+    record?.text,
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (typeof candidate === 'object') return candidate;
+    if (typeof candidate !== 'string') continue;
+
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      const legacy = legacyParser(trimmed);
+      if (legacy) return legacy;
+    }
+  }
+
+  return null;
+}
+
+async function findLegacyIdentityRecord(pb, userId) {
+  const list = await pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
+    filter: `user = "${userId}" && role = "system"`,
+  });
+  return list.items
+    .sort((a, b) => (b.created || '').localeCompare(a.created || ''))
+    .find((item) => Boolean(textToIdentity(item.text))) || null;
+}
+
+async function findLegacyStateRecord(pb, userId) {
   const list = await pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
     filter: `user = "${userId}" && role = "system" && model = "${STATE_MODEL}"`,
   });
@@ -242,6 +304,201 @@ async function findStateRecord(pb, userId) {
       (b.updated || b.created || '').localeCompare(a.updated || a.created || ''),
     )[0] || null
   );
+}
+
+async function findMemoryRecordByField(pb, userId, kind, field) {
+  const list = await pb.collection(PB_MEMORIES_COLLECTION).getList(1, 1, {
+    filter: `user = "${userId}" && ${field} = "${kind}"`,
+    sort: '-updated,-created',
+  });
+  return list.items[0] || null;
+}
+
+async function findMemoryRecord(pb, userId, kind) {
+  const fields = ['kind', 'type', 'model'];
+  for (const field of fields) {
+    try {
+      const found = await findMemoryRecordByField(pb, userId, kind, field);
+      if (found) return found;
+    } catch (error) {
+      if (isMissingCollectionError(error)) return null;
+      if (isFilterFieldError(error)) continue;
+      throw error;
+    }
+  }
+  return null;
+}
+
+async function readIdentityFromMemories(pb, userId) {
+  const record = await findMemoryRecord(pb, userId, MEMORY_KIND_IDENTITY);
+  if (!record) return null;
+  const payload = memoryPayloadFromRecord(record, textToIdentity);
+  if (!payload) return null;
+  return normalizeIdentity(payload);
+}
+
+async function readStateFromMemories(pb, userId) {
+  const record = await findMemoryRecord(pb, userId, MEMORY_KIND_STATE);
+  if (!record) return null;
+  const payload = memoryPayloadFromRecord(record, textToState);
+  if (!payload) return null;
+  return normalizeStatePayload(payload);
+}
+
+async function readIdentity(pb, userId) {
+  const fromMemories = await readIdentityFromMemories(pb, userId);
+  if (fromMemories) return fromMemories;
+
+  const legacy = await findLegacyIdentityRecord(pb, userId);
+  return legacy ? textToIdentity(legacy.text) : null;
+}
+
+async function readState(pb, userId) {
+  const fromMemories = await readStateFromMemories(pb, userId);
+  if (fromMemories) return fromMemories;
+
+  const legacy = await findLegacyStateRecord(pb, userId);
+  return legacy ? textToState(legacy.text) : null;
+}
+
+function buildMemoryCreatePayloadCandidates(userId, kind, payload) {
+  const raw = JSON.stringify(payload);
+  return [
+    { user: userId, kind, content: raw },
+    { user: userId, type: kind, content: raw },
+    { user: userId, kind, text: raw },
+    { user: userId, type: kind, text: raw },
+    { user: userId, model: kind, text: raw },
+    { user: userId, model: kind, payload: raw },
+  ];
+}
+
+function buildMemoryUpdatePayloadFromRecord(record, kind, payload) {
+  const raw = JSON.stringify(payload);
+  const data = {};
+
+  if ('kind' in record) data.kind = kind;
+  else if ('type' in record) data.type = kind;
+  else if ('model' in record) data.model = kind;
+
+  let hasPayloadField = false;
+  if ('content_json' in record) {
+    data.content_json = payload;
+    hasPayloadField = true;
+  }
+  if ('contentJson' in record) {
+    data.contentJson = payload;
+    hasPayloadField = true;
+  }
+  if ('content' in record) {
+    data.content = raw;
+    hasPayloadField = true;
+  }
+  if ('payload' in record) {
+    data.payload = raw;
+    hasPayloadField = true;
+  }
+  if ('text' in record) {
+    data.text = raw;
+    hasPayloadField = true;
+  }
+
+  if (!hasPayloadField) {
+    data.content = raw;
+  }
+
+  return data;
+}
+
+async function upsertMemoryRecord(pb, userId, kind, payload) {
+  let existing = null;
+  try {
+    existing = await findMemoryRecord(pb, userId, kind);
+  } catch (error) {
+    if (isMissingCollectionError(error)) return false;
+    throw error;
+  }
+
+  if (existing) {
+    const smartPayload = buildMemoryUpdatePayloadFromRecord(existing, kind, payload);
+    try {
+      await pb.collection(PB_MEMORIES_COLLECTION).update(existing.id, smartPayload);
+      return true;
+    } catch (error) {
+      if (isMissingCollectionError(error)) return false;
+      if (!isRecoverableMemoryWriteError(error)) throw error;
+    }
+  }
+
+  const candidates = buildMemoryCreatePayloadCandidates(userId, kind, payload);
+  for (const candidate of candidates) {
+    try {
+      if (existing) {
+        await pb.collection(PB_MEMORIES_COLLECTION).update(existing.id, candidate);
+      } else {
+        await pb.collection(PB_MEMORIES_COLLECTION).create(candidate);
+      }
+      return true;
+    } catch (error) {
+      if (isMissingCollectionError(error)) return false;
+      if (!isRecoverableMemoryWriteError(error)) throw error;
+    }
+  }
+
+  return false;
+}
+
+async function saveLegacyIdentity(pb, userId, identity) {
+  await pb.collection(PB_CHAT_COLLECTION).create({
+    user: userId,
+    role: 'system',
+    text: identityToText(identity),
+    model: MEMORY_KIND_IDENTITY,
+  });
+}
+
+async function saveLegacyState(pb, userId, state) {
+  const text = stateToText(state);
+  const existing = await findLegacyStateRecord(pb, userId);
+  if (existing) {
+    await pb.collection(PB_CHAT_COLLECTION).update(existing.id, {
+      role: 'system',
+      model: STATE_MODEL,
+      text,
+    });
+    return;
+  }
+
+  await pb.collection(PB_CHAT_COLLECTION).create({
+    user: userId,
+    role: 'system',
+    model: STATE_MODEL,
+    text,
+  });
+}
+
+async function saveIdentity(pb, userId, identity) {
+  const saved = await upsertMemoryRecord(pb, userId, MEMORY_KIND_IDENTITY, normalizeIdentity(identity));
+  if (saved) return;
+  await saveLegacyIdentity(pb, userId, identity);
+}
+
+async function saveState(pb, userId, state) {
+  const normalized = normalizeStatePayload(state);
+  const saved = await upsertMemoryRecord(pb, userId, MEMORY_KIND_STATE, normalized);
+  if (saved) return;
+  await saveLegacyState(pb, userId, normalized);
+}
+
+function mapMemoryRecord(record) {
+  const kind = record.kind || record.type || record.model || 'unknown';
+  return {
+    id: record.id,
+    kind,
+    content: memoryPayloadFromRecord(record, () => null),
+    createdAt: record.created || null,
+    updatedAt: record.updated || null,
+  };
 }
 
 function buildSystemPrompt(identity) {
@@ -473,6 +730,7 @@ app.get('/api/health', (_req, res) => {
       url: PB_URL || '',
       usersCollection: PB_USERS_COLLECTION,
       chatCollection: PB_CHAT_COLLECTION,
+      memoriesCollection: PB_MEMORIES_COLLECTION,
     },
     model: {
       text: DEEPSEEK_API_KEY ? DEEPSEEK_TEXT_MODEL : TEXT_MODEL,
@@ -627,13 +885,7 @@ app.get('/api/identity', async (req, res) => {
       return res.status(401).json({ error: 'missing bearer token' });
     }
     const auth = await authByToken(token);
-    const list = await auth.pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
-      filter: `user = "${auth.user.id}" && role = "system"`,
-    });
-    const found = list.items
-      .sort((a, b) => (b.created || '').localeCompare(a.created || ''))
-      .map((item) => textToIdentity(item.text))
-      .find((item) => item && item.userName && item.companionName);
+    const found = await readIdentity(auth.pb, auth.user.id);
     return res.json({
       identity: found || null,
     });
@@ -651,12 +903,7 @@ app.post('/api/identity', async (req, res) => {
     }
     const auth = await authByToken(token);
     const identity = normalizeIdentity(req.body || {});
-    await auth.pb.collection(PB_CHAT_COLLECTION).create({
-      user: auth.user.id,
-      role: 'system',
-      text: identityToText(identity),
-      model: 'identity-v1',
-    });
+    await saveIdentity(auth.pb, auth.user.id, identity);
     return res.json({ identity });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'identity save failed';
@@ -671,8 +918,7 @@ app.get('/api/state', async (req, res) => {
       return res.status(401).json({ error: 'missing bearer token' });
     }
     const auth = await authByToken(token);
-    const record = await findStateRecord(auth.pb, auth.user.id);
-    const state = record ? textToState(record.text) : null;
+    const state = await readState(auth.pb, auth.user.id);
     return res.json({ state: state || null });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'state fetch failed';
@@ -693,24 +939,47 @@ app.post('/api/state', async (req, res) => {
       return res.status(400).json({ error: 'state payload too large' });
     }
 
-    const existing = await findStateRecord(auth.pb, auth.user.id);
-    if (existing) {
-      await auth.pb.collection(PB_CHAT_COLLECTION).update(existing.id, {
-        role: 'system',
-        model: STATE_MODEL,
-        text,
-      });
-    } else {
-      await auth.pb.collection(PB_CHAT_COLLECTION).create({
-        user: auth.user.id,
-        role: 'system',
-        model: STATE_MODEL,
-        text,
-      });
-    }
+    await saveState(auth.pb, auth.user.id, state);
     return res.json({ state });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'state save failed';
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.get('/api/memories', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ error: 'missing bearer token' });
+    }
+
+    const auth = await authByToken(token);
+    const limitRaw = Number(req.query.limit || 50);
+    const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(limitRaw, 200)) : 50;
+
+    try {
+      const list = await auth.pb.collection(PB_MEMORIES_COLLECTION).getList(1, limit, {
+        filter: `user = "${auth.user.id}"`,
+        sort: '-updated,-created',
+      });
+
+      return res.json({
+        memories: list.items.map(mapMemoryRecord),
+      });
+    } catch (error) {
+      if (!isMissingCollectionError(error)) throw error;
+
+      const fallback = [];
+      const identity = await readIdentity(auth.pb, auth.user.id);
+      const state = await readState(auth.pb, auth.user.id);
+      if (identity) fallback.push({ kind: MEMORY_KIND_IDENTITY, content: identity });
+      if (state) fallback.push({ kind: MEMORY_KIND_STATE, content: state });
+
+      return res.json({ memories: fallback });
+    }
+  } catch (error) {
+    const message = error?.response?.message || error?.message || 'memories fetch failed';
     return res.status(400).json({ error: message });
   }
 });

@@ -1,13 +1,16 @@
 {
   "name": "growup",
-  "version": "1.0.0",
+  "version": "1.18.0",
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "server": "node server/index.js"
+    "server": "node server/index.js",
+    "smoke:sealos": "node scripts/verify-sealos-api.js",
+    "build:apk": "node scripts/build-android-release.js",
+    "migrate:memory": "node scripts/migrate-legacy-memory.js"
   },
   "dependencies": {
     "@expo-google-fonts/playfair-display": "^0.4.2",
@@ -23,6 +26,7 @@
     "expo-image-picker": "~17.0.10",
     "expo-linear-gradient": "~15.0.8",
     "expo-status-bar": "~3.0.9",
+    "expo-updates": "~29.0.16",
     "express": "^5.2.1",
     "pocketbase": "^0.26.8",
     "react": "19.1.0",

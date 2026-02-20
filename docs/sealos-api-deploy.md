@@ -1,6 +1,6 @@
 # 知己 API（Sealos）部署说明
 
-最后更新：2026-02-19
+最后更新：2026-02-20
 
 ## 目标
 
@@ -27,6 +27,7 @@
 - `POCKETBASE_URL_NEW=https://pocketbase-tocxusnx.cloud.sealos.io`
 - `POCKETBASE_USERS_COLLECTION=users`
 - `POCKETBASE_CHAT_COLLECTION=chat_messages`
+- `POCKETBASE_MEMORIES_COLLECTION=memories`
 - `DEEPSEEK_API_KEY=<你的 DeepSeek key>`
 - `DEEPSEEK_TEXT_MODEL=deepseek-chat`
 - `DEEPSEEK_BASE_URL=https://api.deepseek.com`
@@ -46,8 +47,15 @@
 1. `GET <API_DOMAIN>/api/health`
 2. `POST <API_DOMAIN>/api/auth/register`
 3. `POST <API_DOMAIN>/api/auth/login`
+4. `POST <API_DOMAIN>/api/chat`（不带 `Bearer token`）应返回 `401`
 
 如果 `health` 返回 `ok: true` 且 `pocketbase.configured: true`，说明 API 正常。
+
+也可以直接在仓库根目录执行一键烟测：
+
+```bash
+npm run smoke:sealos
+```
 
 ## 四、切换 APP 到 Sealos API
 
@@ -81,3 +89,6 @@ npx eas-cli build -p android --profile preview --non-interactive
 3. 如果 Sealos 可访问但 APP 不可访问，优先检查：
 - EAS 中 `EXPO_PUBLIC_API_BASE_URL` 是否还是旧的 `vercel.app`
 - 安装包是否是最新构建
+
+## Current Deployed Runtime
+- See `docs/sealos-runtime-status.md` for the active Sealos API URL and runtime details.

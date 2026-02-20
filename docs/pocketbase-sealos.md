@@ -1,35 +1,31 @@
 # GrowUp PocketBase (Sealos) Deployment Notes
 
-Last updated: 2026-02-18
+Last updated: 2026-02-20
 
 ## 1) Instance Overview
 
 - Provider: Sealos Cloud
 - Region: Singapore
-- Team/Workspace: Private Team
 - Template: PocketBase (App Store)
-- Sealos app name used during deploy: `growup-pocketbase-sealos`
-- Instance name: `pocketbase-wydxpmyd`
-- Status: running
-- Created at (Sealos): `2026-02-18 16:41`
-- Container image: `adrianmusante/pocketbase:0.29.3`
+- Instance status: running
+- Public endpoint in use: `https://pocketbase-tocxusnx.cloud.sealos.io`
 
 ## 2) Network Endpoints
 
-- Public URL (use this in app/backend):
+- Public URL (app/backend should use):
   - `https://pocketbase-tocxusnx.cloud.sealos.io`
-- Internal URL (Sealos internal service):
-  - `http://pocketbase-wydxpmyd.ns-i0nobo1l:3000`
 - Admin console:
   - `https://pocketbase-tocxusnx.cloud.sealos.io/_/`
 
-## 3) Admin Credentials
+## 3) Secrets Policy
 
-- Admin email: `growup.admin@local.dev`
-- Admin password: `GrowupPB_2026!J8vF`
-- PB_ENCRYPTION_KEY (from deploy form): `oxobzaynobktddkfushggffkszfxflsr`
+This repository no longer stores plaintext PocketBase secrets.
 
-Security note: these are production-like secrets. Rotate password/key if this file is shared externally.
+Store these values only in secure places:
+- PocketBase admin email/password
+- `PB_ENCRYPTION_KEY`
+
+If any secret was exposed before, rotate it immediately.
 
 ## 4) Local Environment Configuration
 
@@ -39,49 +35,61 @@ Set these values in `.env.local`:
 POCKETBASE_URL_NEW=https://pocketbase-tocxusnx.cloud.sealos.io
 POCKETBASE_USERS_COLLECTION=users
 POCKETBASE_CHAT_COLLECTION=chat_messages
+POCKETBASE_MEMORIES_COLLECTION=memories
 ```
 
-Current backend fallback behavior:
+Backend fallback behavior:
 - `POCKETBASE_URL_NEW` is preferred.
 - If missing, code falls back to `POCKETBASE_URL`.
 
-## 5) PocketBase Collections Required by GrowUp
+## 5) PocketBase Collections Required by App
 
 ### `users` (Auth collection)
 
 - Type: auth collection (email/password login)
-- Status on this instance: already exists (id: `_pb_users_auth_`)
-- Suggested extra fields:
+- Suggested extra field:
   - `name` (text)
 
 ### `chat_messages` (Base collection)
 
-- Status on this instance: created (id: `pbc_102036695`)
+Required fields:
 - `user` (relation -> `users`, required, max select 1)
 - `role` (text, values: `user` / `assistant` / `system`)
 - `text` (text)
 - `model` (text, optional)
 - `image` (file, optional)
 
+Internal usage:
+- Stores only user/assistant chat records in current architecture.
+- Legacy compatibility: old `system` snapshots can still be read by backend fallback.
+
+### `memories` (Base collection)
+
+Required fields (at least one content field is enough):
+- `user` (relation -> `users`, required, max select 1)
+- `kind` (text, recommended values: `identity-v1` / `state-v1`)
+- `content` (text, JSON string) or `text` (text, JSON string)
+
+Optional fields:
+- `type` (text, compatibility)
+- `model` (text, compatibility)
+
 Recommended API rules (list/view/create/update/delete):
 
 ```txt
-@request.auth.id != "" && user.id = @request.auth.id
+@request.auth.id != "" && user = @request.auth.id
 ```
 
 ## 6) Quick Verification
 
-Verified from local shell:
-
 - `GET https://pocketbase-tocxusnx.cloud.sealos.io/api/health` -> `200`
 - `GET https://pocketbase-tocxusnx.cloud.sealos.io/_/` -> `200`
-- Start local backend and call `GET http://localhost:8787/api/health` -> `pocketbase.configured: true`
-- `POST http://localhost:8787/api/auth/register` smoke test -> success (temporary user created and then deleted)
+- Local backend `GET /api/health` should show `pocketbase.configured: true`
 
 ## 7) App Integration Checklist
 
 1. Keep `ZHIPU_API_KEY` in `.env.local`.
-2. Set `POCKETBASE_URL_NEW` to this new Sealos URL.
-3. Verify `users` and `chat_messages` collections in PocketBase admin.
+2. Set `POCKETBASE_URL_NEW` to the Sealos PocketBase URL.
+3. Verify `users`, `chat_messages`, `memories` collections in PocketBase admin.
 4. Start backend: `npm run server`.
-5. Check health endpoint: `GET /api/health` and confirm `pocketbase.configured = true`.
+5. Verify `GET /api/health`.
