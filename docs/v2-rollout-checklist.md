@@ -74,3 +74,13 @@
 - [ ] Sealos env add `QDRANT_URL` and optional `QDRANT_API_KEY`.
 - [ ] Sealos click `变更` (Redeploy) and verify `/api/health.vector.enabled=true`.
 - [ ] Run `npm run smoke:sealos` plus one authenticated `/api/chat` and confirm no regression.
+
+## 2026-02-20 Phase B.1 Runtime Completion (Sealos)
+- [x] Deploy Qdrant app (`qdrant/qdrant`, port `6333`) on Sealos.
+- [x] Wire API runtime to Qdrant (`QDRANT_URL`, `QDRANT_COLLECTION`) and redeploy via `变更`.
+- [x] Verify `/api/health.vector.enabled=true` and `/api/health.vector.configured=true`.
+- [x] Run `npm run smoke:sealos` successfully.
+- [x] Run `REQUIRE_VECTOR=true npm run smoke:sealos` successfully.
+- Note: this run used startup command injection for Qdrant vars due env-modal persistence issue in Sealos UI.
+- [x] Backend fallback: `/api/chat` reads day recaps from `state.recaps` and injects into context without vector dependency.
+- [x] Backend-only hotfix deployed; no client upgrade required for this capability.

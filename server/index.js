@@ -410,6 +410,53 @@ function mergeRelevantMemories(baseMemories, vectorMemories) {
   return merged.slice(0, 18);
 }
 
+function buildRecapMemoriesFromState(state, queryText, limit = 2) {
+  if (!state || !Array.isArray(state.recaps) || state.recaps.length === 0) return [];
+
+  const tokens = normalizeTextForVector(queryText)
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_]+/u)
+    .filter((token) => token.length >= 2);
+
+  const dayRecaps = state.recaps
+    .filter((item) => item && item.period === 'day')
+    .sort((a, b) => String(b.endDate || '').localeCompare(String(a.endDate || '')));
+
+  const scored = dayRecaps
+    .map((item, index) => {
+      const summary = normalizeTextForVector(String(item.summary || ''));
+      const highlights = Array.isArray(item.highlights)
+        ? item.highlights.map((x) => normalizeTextForVector(String(x || ''))).filter(Boolean)
+        : [];
+      const actions = Array.isArray(item.actions)
+        ? item.actions.map((x) => normalizeTextForVector(String(x || ''))).filter(Boolean)
+        : [];
+      const corpus = [summary, ...highlights, ...actions].join(' ').toLowerCase();
+
+      let score = index === 0 ? 0.25 : 0;
+      for (const token of tokens) {
+        if (corpus.includes(token)) score += 1;
+      }
+
+      return { item, summary, highlights, actions, score };
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return String(b.item.endDate || '').localeCompare(String(a.item.endDate || ''));
+    })
+    .slice(0, Math.max(1, Math.min(limit, 4)));
+
+  const memories = [];
+  for (const row of scored) {
+    const label = String(row.item.label || row.item.endDate || '').trim();
+    if (row.summary) memories.push(`日复盘(${label || '最近一天'})：${row.summary.slice(0, 140)}`);
+    if (row.highlights[0]) memories.push(`日亮点(${label || '最近一天'})：${row.highlights[0].slice(0, 100)}`);
+    if (row.actions[0]) memories.push(`日行动(${label || '最近一天'})：${row.actions[0].slice(0, 100)}`);
+  }
+
+  return memories.slice(0, 6);
+}
+
 async function persistChatWithTimeout(auth, message, imageDataUrl, modelResult) {
   if (!auth || !PB_URL) return false;
   const persistTask = (async () => {
@@ -1289,11 +1336,21 @@ app.post('/api/chat', async (req, res) => {
     const vectorMemories = message
       ? await searchVectorMemories(auth.user.id, message, VECTOR_TOP_K)
       : [];
+    let recapMemories = [];
+    try {
+      const state = await readState(auth.pb, auth.user.id);
+      recapMemories = buildRecapMemoriesFromState(state, message, 2);
+    } catch (error) {
+      console.warn(`[recap] read state failed: ${error?.message || 'unknown error'}`);
+    }
     const payloadForModel = {
       message,
       imageDataUrl,
       relevantMemories: mergeRelevantMemories(
-        Array.isArray(payload.relevantMemories) ? payload.relevantMemories : [],
+        [
+          ...(Array.isArray(payload.relevantMemories) ? payload.relevantMemories : []),
+          ...recapMemories,
+        ],
         vectorMemories,
       ),
       todayJournal: payload.todayJournal || null,
