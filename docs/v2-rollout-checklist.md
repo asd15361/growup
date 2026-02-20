@@ -16,7 +16,7 @@
 - [x] `.env.example` 增加 `POCKETBASE_MEMORIES_COLLECTION`。
 - [x] 新增迁移脚本 `npm run migrate:memory`。
 - [ ] 在 PocketBase 创建 `memories` collection（线上）。
-- [ ] Sealos 发布后验收 `GET /api/memories` 返回正常。
+- [x] Sealos 发布后验收 `GET /api/memories` 返回 `200`（当前为兼容回退模式）。
 - [ ] 对 1 个老账号执行迁移脚本并记录结果。
 
 ## 2. 本阶段发布步骤（固定流程）
@@ -57,3 +57,9 @@
 
 - 你说：`继续下一步`  
 我就按清单自动执行，不需要你记任何命令。
+
+## 2026-02-20 Execution Update
+- [x] Online PocketBase `memories` collection created and rule-isolated by user.
+- [x] `/api/identity` first-write regression fixed and deployed (`4a61b76`).
+- [x] Sealos app `growup-api-3c44t6` restarted to pick latest Git code.
+- [x] Online acceptance passed (`smoke:sealos` + identity/memories real-record checks).
