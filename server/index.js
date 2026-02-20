@@ -155,10 +155,9 @@ function withTimeout(promise, timeoutMs, label = 'pocketbase') {
   });
 }
 
-async function persistChatWithTimeout(token, message, imageDataUrl, modelResult) {
-  if (!token || !PB_URL) return false;
+async function persistChatWithTimeout(auth, message, imageDataUrl, modelResult) {
+  if (!auth || !PB_URL) return false;
   const persistTask = (async () => {
-    const auth = await authByToken(token);
     await saveUserMessage(auth.pb, auth.user.id, message || '[图片]', modelResult.model, imageDataUrl);
     await saveAssistantMessage(auth.pb, auth.user.id, modelResult.reply, modelResult.model);
     return true;
@@ -709,6 +708,19 @@ app.post('/api/state', async (req, res) => {
 
 app.post('/api/chat', async (req, res) => {
   try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ error: 'missing bearer token' });
+    }
+
+    let auth = null;
+    try {
+      auth = await authByToken(token);
+    } catch (error) {
+      const message = error?.response?.message || error?.message || 'invalid token';
+      return res.status(401).json({ error: message });
+    }
+
     const payload = req.body || {};
     const message = typeof payload.message === 'string' ? payload.message.trim() : '';
     const imageDataUrl = typeof payload.imageDataUrl === 'string' ? payload.imageDataUrl.trim() : '';
@@ -732,8 +744,7 @@ app.post('/api/chat', async (req, res) => {
         ? await chatWithDeepSeek(payloadForModel)
         : await chatWithZhipu(payloadForModel);
 
-    const token = getBearerToken(req);
-    const persisted = await persistChatWithTimeout(token, message, imageDataUrl, modelResult);
+    const persisted = await persistChatWithTimeout(auth, message, imageDataUrl, modelResult);
 
     return res.json({
       reply: modelResult.reply,
