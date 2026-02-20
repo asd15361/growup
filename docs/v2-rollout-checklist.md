@@ -84,3 +84,10 @@
 - Note: this run used startup command injection for Qdrant vars due env-modal persistence issue in Sealos UI.
 - [x] Backend fallback: `/api/chat` reads day recaps from `state.recaps` and injects into context without vector dependency.
 - [x] Backend-only hotfix deployed; no client upgrade required for this capability.
+
+## 2026-02-20 Hotfix Rollout (No-vector recap fallback path)
+- [x] Push hotfix commit `de4aa6c` to `origin/master`.
+- [x] Trigger Sealos `±ä¸ü` rollout on `growup-api-3c44t6`.
+- [x] Confirm new pod rollout and return to single running pod.
+- [x] Run `npm run smoke:sealos` successfully after rollout.
+- [ ] Apply runtime `VECTOR_ENABLED=false` in Sealos (blocked by intermittent AppLaunchpad form mismatch to `hello-world`; retry in next ops window).
