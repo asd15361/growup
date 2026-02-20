@@ -247,7 +247,17 @@ function isMissingCollectionError(error) {
 
 function isFilterFieldError(error) {
   const message = pbErrorMessage(error).toLowerCase();
-  return message.includes('filter') && (message.includes('invalid') || message.includes('unknown') || message.includes('failed'));
+  if (message.includes('filter') && (message.includes('invalid') || message.includes('unknown') || message.includes('failed'))) {
+    return true;
+  }
+
+  // PocketBase may return a generic 400 when a filter references a non-existing field.
+  const status = Number(error?.status || error?.response?.status || 0);
+  if (status === 400 && message.includes('something went wrong')) {
+    return true;
+  }
+
+  return false;
 }
 
 function isRecoverableMemoryWriteError(error) {
