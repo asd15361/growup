@@ -63,3 +63,14 @@
 - [x] `/api/identity` first-write regression fixed and deployed (`4a61b76`).
 - [x] Sealos app `growup-api-3c44t6` restarted to pick latest Git code.
 - [x] Online acceptance passed (`smoke:sealos` + identity/memories real-record checks).
+
+## 2026-02-20 Phase B.1 (Vector DB only)
+
+- [x] Backend integrated with Qdrant vector storage/retrieval (graph DB intentionally skipped).
+- [x] `/api/chat` now merges vector-retrieved memories into model context.
+- [x] User messages are indexed to Qdrant asynchronously after persistence.
+- [x] Added vector runtime status to `GET /api/health`.
+- [x] Added vector env vars to `.env.example`.
+- [ ] Sealos env add `QDRANT_URL` and optional `QDRANT_API_KEY`.
+- [ ] Sealos click `±ä¸ü` (Redeploy) and verify `/api/health.vector.enabled=true`.
+- [ ] Run `npm run smoke:sealos` plus one authenticated `/api/chat` and confirm no regression.

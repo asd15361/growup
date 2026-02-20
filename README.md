@@ -102,3 +102,25 @@ npm run build:apk
 
 - 不要把真实 API Key、PocketBase 管理员密码、加密密钥提交到仓库。
 - 若密钥曾外泄，请立即在对应平台重置。
+
+## Vector Memory (Phase B.1)
+
+This repo now supports vector retrieval with Qdrant (graph DB is intentionally not included in this phase).
+
+1. Configure `.env.local` in `server` runtime:
+- `QDRANT_URL`
+- `QDRANT_API_KEY` (optional)
+- `QDRANT_COLLECTION=growup_memories`
+
+2. Optional tuning:
+- `VECTOR_TOP_K=6`
+- `VECTOR_DIM=384`
+- `VECTOR_TIMEOUT_MS=6000`
+
+3. Runtime behavior:
+- When `QDRANT_URL` is configured, `/api/chat` will retrieve relevant memory snippets from Qdrant and merge them into prompt context.
+- User chat messages are asynchronously indexed into Qdrant after persistence.
+- If Qdrant is unavailable, backend auto-falls back to non-vector flow (with retry backoff), chat stays available.
+
+4. Health check:
+- `GET /api/health` includes `vector` status fields (`enabled/configured/collection/dimension/topK/backoffUntil`).

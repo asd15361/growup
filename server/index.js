@@ -1,5 +1,6 @@
 ﻿const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
@@ -31,6 +32,19 @@ const DEEPSEEK_CHAT_URL = `${DEEPSEEK_BASE_URL}/chat/completions`;
 const MODEL_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS || 45000);
 const CHAT_PERSIST_TIMEOUT_MS = Number(process.env.CHAT_PERSIST_TIMEOUT_MS || 1500);
 const POCKETBASE_TIMEOUT_MS = Number(process.env.POCKETBASE_TIMEOUT_MS || 15000);
+const VECTOR_ENABLED_RAW = (process.env.VECTOR_ENABLED || '').trim().toLowerCase();
+const VECTOR_ENABLED = VECTOR_ENABLED_RAW
+  ? ['1', 'true', 'yes', 'on'].includes(VECTOR_ENABLED_RAW)
+  : true;
+const QDRANT_URL = (process.env.QDRANT_URL || '').trim().replace(/\/+$/, '');
+const QDRANT_API_KEY = (process.env.QDRANT_API_KEY || '').trim();
+const QDRANT_COLLECTION = (process.env.QDRANT_COLLECTION || 'growup_memories').trim();
+const VECTOR_DIM = Number(process.env.VECTOR_DIM || 384);
+const VECTOR_TOP_K = Number(process.env.VECTOR_TOP_K || 6);
+const VECTOR_TEXT_MAX_CHARS = Number(process.env.VECTOR_TEXT_MAX_CHARS || 1200);
+const VECTOR_TIMEOUT_MS = Number(process.env.VECTOR_TIMEOUT_MS || 6000);
+const VECTOR_BACKOFF_MS = Number(process.env.VECTOR_BACKOFF_MS || 60000);
+const VECTOR_MIN_QUERY_CHARS = Number(process.env.VECTOR_MIN_QUERY_CHARS || 4);
 
 const PB_URL = (process.env.POCKETBASE_URL_NEW || process.env.POCKETBASE_URL || '').trim();
 const PB_USERS_COLLECTION = (process.env.POCKETBASE_USERS_COLLECTION || 'users').trim();
@@ -41,6 +55,9 @@ const STATE_PREFIX = '__app_state__::';
 const STATE_MODEL = 'state-v1';
 const MEMORY_KIND_IDENTITY = 'identity-v1';
 const MEMORY_KIND_STATE = 'state-v1';
+
+let vectorCollectionReady = false;
+let vectorBackoffUntil = 0;
 
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
@@ -167,10 +184,246 @@ function withTimeout(promise, timeoutMs, label = 'pocketbase') {
   });
 }
 
+function isVectorConfigured() {
+  return VECTOR_ENABLED && Boolean(QDRANT_URL) && VECTOR_DIM > 0;
+}
+
+function shouldSkipVectorTemporarily() {
+  return Date.now() < vectorBackoffUntil;
+}
+
+function scheduleVectorRetry(reason) {
+  vectorCollectionReady = false;
+  vectorBackoffUntil = Date.now() + Math.max(1000, VECTOR_BACKOFF_MS);
+  if (reason) {
+    console.warn(`[vector] temporarily disabled: ${reason}`);
+  }
+}
+
+function normalizeTextForVector(text) {
+  if (typeof text !== 'string') return '';
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.slice(0, Math.max(200, VECTOR_TEXT_MAX_CHARS));
+}
+
+function createVectorTokens(text) {
+  const normalized = normalizeTextForVector(text).toLowerCase();
+  if (!normalized) return [];
+
+  const words = normalized.split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
+  const chars = normalized.replace(/\s+/g, '').split('');
+  const bigrams = [];
+  for (let i = 0; i < chars.length - 1; i += 1) {
+    bigrams.push(`${chars[i]}${chars[i + 1]}`);
+  }
+  return [...words, ...chars, ...bigrams];
+}
+
+function localHashEmbedding(text) {
+  const dim = Math.max(32, VECTOR_DIM);
+  const vector = new Array(dim).fill(0);
+  const tokens = createVectorTokens(text);
+
+  if (!tokens.length) {
+    return vector;
+  }
+
+  for (const token of tokens) {
+    const hash = crypto.createHash('sha1').update(token).digest();
+    const indexA = hash.readUInt32BE(0) % dim;
+    const indexB = hash.readUInt32BE(4) % dim;
+    const signA = hash[8] % 2 === 0 ? 1 : -1;
+    const signB = hash[9] % 2 === 0 ? 1 : -1;
+    vector[indexA] += signA;
+    vector[indexB] += signB * 0.5;
+  }
+
+  let norm = 0;
+  for (const value of vector) {
+    norm += value * value;
+  }
+  norm = Math.sqrt(norm);
+  if (norm > 0) {
+    for (let i = 0; i < vector.length; i += 1) {
+      vector[i] = Number((vector[i] / norm).toFixed(6));
+    }
+  }
+  return vector;
+}
+
+function toDeterministicUuid(input) {
+  const hash = crypto.createHash('sha1').update(String(input || '')).digest('hex');
+  return [
+    hash.slice(0, 8),
+    hash.slice(8, 12),
+    `4${hash.slice(13, 16)}`,
+    `a${hash.slice(17, 20)}`,
+    hash.slice(20, 32),
+  ].join('-');
+}
+
+async function qdrantRequest(method, endpoint, body) {
+  if (!QDRANT_URL) {
+    const error = new Error('QDRANT_URL is missing');
+    error.status = 503;
+    throw error;
+  }
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (QDRANT_API_KEY) {
+    headers['api-key'] = QDRANT_API_KEY;
+  }
+
+  return fetchJsonWithTimeout(
+    `${QDRANT_URL}${endpoint}`,
+    {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    },
+    VECTOR_TIMEOUT_MS,
+  );
+}
+
+async function ensureVectorCollection() {
+  if (!isVectorConfigured() || shouldSkipVectorTemporarily()) return false;
+  if (vectorCollectionReady) return true;
+
+  const collectionPath = `/collections/${encodeURIComponent(QDRANT_COLLECTION)}`;
+  try {
+    const check = await qdrantRequest('GET', collectionPath);
+    if (check.response.status === 404) {
+      const created = await qdrantRequest('PUT', collectionPath, {
+        vectors: { size: VECTOR_DIM, distance: 'Cosine' },
+      });
+      if (!created.response.ok) {
+        throw new Error(`create collection failed: ${created.response.status}`);
+      }
+    } else if (!check.response.ok) {
+      throw new Error(`check collection failed: ${check.response.status}`);
+    }
+
+    vectorCollectionReady = true;
+    vectorBackoffUntil = 0;
+    return true;
+  } catch (error) {
+    scheduleVectorRetry(error?.message || 'qdrant unavailable');
+    return false;
+  }
+}
+
+function formatVectorMemoryItem(payload) {
+  const sourceText = normalizeTextForVector(payload?.text || payload?.summary || '');
+  if (!sourceText) return '';
+  const createdAt = typeof payload?.createdAt === 'string' ? payload.createdAt : '';
+  const date = createdAt ? createdAt.slice(0, 10) : '';
+  return date ? `[${date}] ${sourceText}` : sourceText;
+}
+
+async function searchVectorMemories(userId, queryText, topK = VECTOR_TOP_K) {
+  if (!isVectorConfigured() || shouldSkipVectorTemporarily()) return [];
+  const safeQuery = normalizeTextForVector(queryText);
+  if (safeQuery.length < Math.max(1, VECTOR_MIN_QUERY_CHARS)) return [];
+
+  const ready = await ensureVectorCollection();
+  if (!ready) return [];
+
+  const vector = localHashEmbedding(safeQuery);
+  const collectionPath = `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/search`;
+
+  try {
+    const { response, data } = await qdrantRequest('POST', collectionPath, {
+      vector,
+      limit: Math.max(1, Math.min(topK, 12)),
+      with_payload: true,
+      with_vector: false,
+      filter: {
+        must: [{ key: 'userId', match: { value: userId } }],
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`search failed: ${response.status}`);
+    }
+
+    const points = Array.isArray(data?.result) ? data.result : [];
+    return points
+      .map((point) => formatVectorMemoryItem(point?.payload || {}))
+      .filter(Boolean);
+  } catch (error) {
+    scheduleVectorRetry(error?.message || 'search failed');
+    return [];
+  }
+}
+
+async function upsertVectorMemory(payload) {
+  if (!isVectorConfigured() || shouldSkipVectorTemporarily()) return false;
+  const text = normalizeTextForVector(payload?.text || '');
+  if (!text) return false;
+
+  const ready = await ensureVectorCollection();
+  if (!ready) return false;
+
+  const vector = localHashEmbedding(text);
+  const pointId = toDeterministicUuid(`${payload?.userId || ''}:${payload?.source || 'chat'}:${payload?.sourceId || text}`);
+  const collectionPath = `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points?wait=false`;
+
+  const pointPayload = {
+    userId: payload?.userId || '',
+    source: payload?.source || 'chat',
+    sourceId: payload?.sourceId || '',
+    role: payload?.role || 'user',
+    text,
+    createdAt: payload?.createdAt || new Date().toISOString(),
+  };
+
+  try {
+    const { response } = await qdrantRequest('PUT', collectionPath, {
+      points: [{ id: pointId, vector, payload: pointPayload }],
+    });
+    if (!response.ok) {
+      throw new Error(`upsert failed: ${response.status}`);
+    }
+    return true;
+  } catch (error) {
+    scheduleVectorRetry(error?.message || 'upsert failed');
+    return false;
+  }
+}
+
+function mergeRelevantMemories(baseMemories, vectorMemories) {
+  const merged = [];
+  const seen = new Set();
+  const all = [
+    ...(Array.isArray(baseMemories) ? baseMemories : []),
+    ...(Array.isArray(vectorMemories) ? vectorMemories : []),
+  ];
+
+  for (const item of all) {
+    const normalized = normalizeTextForVector(typeof item === 'string' ? item : '');
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    merged.push(normalized);
+  }
+
+  return merged.slice(0, 18);
+}
+
 async function persistChatWithTimeout(auth, message, imageDataUrl, modelResult) {
   if (!auth || !PB_URL) return false;
   const persistTask = (async () => {
-    await saveUserMessage(auth.pb, auth.user.id, message || '[图片]', modelResult.model, imageDataUrl);
+    const savedUser = await saveUserMessage(auth.pb, auth.user.id, message || '[图片]', modelResult.model, imageDataUrl);
+    if (message) {
+      void upsertVectorMemory({
+        userId: auth.user.id,
+        source: 'chat_message',
+        sourceId: savedUser?.id || `chat-${Date.now()}`,
+        role: 'user',
+        text: message,
+        createdAt: savedUser?.created || new Date().toISOString(),
+      });
+    }
     await saveAssistantMessage(auth.pb, auth.user.id, modelResult.reply, modelResult.model);
     return true;
   })().catch(() => false);
@@ -742,6 +995,16 @@ app.get('/api/health', (_req, res) => {
       chatCollection: PB_CHAT_COLLECTION,
       memoriesCollection: PB_MEMORIES_COLLECTION,
     },
+    vector: {
+      enabled: isVectorConfigured(),
+      provider: 'qdrant',
+      embedding: 'local-hash',
+      configured: Boolean(QDRANT_URL),
+      collection: QDRANT_COLLECTION,
+      dimension: VECTOR_DIM,
+      topK: VECTOR_TOP_K,
+      backoffUntil: vectorBackoffUntil || null,
+    },
     model: {
       text: DEEPSEEK_API_KEY ? DEEPSEEK_TEXT_MODEL : TEXT_MODEL,
       vision: VISION_MODEL,
@@ -1023,10 +1286,16 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'internal recap prompt is not allowed on chat endpoint' });
     }
 
+    const vectorMemories = message
+      ? await searchVectorMemories(auth.user.id, message, VECTOR_TOP_K)
+      : [];
     const payloadForModel = {
       message,
       imageDataUrl,
-      relevantMemories: Array.isArray(payload.relevantMemories) ? payload.relevantMemories : [],
+      relevantMemories: mergeRelevantMemories(
+        Array.isArray(payload.relevantMemories) ? payload.relevantMemories : [],
+        vectorMemories,
+      ),
       todayJournal: payload.todayJournal || null,
       identity: payload.identity || null,
     };
@@ -1057,6 +1326,9 @@ if (!process.env.VERCEL) {
       `[growup-server] zhipu=${ZHIPU_API_KEY ? 'configured' : 'missing'} deepseek=${DEEPSEEK_API_KEY ? 'configured' : 'missing'} text=${DEEPSEEK_API_KEY ? DEEPSEEK_TEXT_MODEL : TEXT_MODEL} vision=${VISION_MODEL}`,
     );
     console.log(`[growup-server] pocketbase=${PB_URL ? PB_URL : 'missing'} users=${PB_USERS_COLLECTION} chats=${PB_CHAT_COLLECTION}`);
+    console.log(
+      `[growup-server] vector=${isVectorConfigured() ? 'enabled' : 'disabled'} qdrant=${QDRANT_URL ? 'configured' : 'missing'} collection=${QDRANT_COLLECTION} dim=${VECTOR_DIM} topK=${VECTOR_TOP_K}`,
+    );
   });
 }
 

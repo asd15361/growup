@@ -30,6 +30,9 @@ async function checkHealth(baseUrl) {
   return {
     status: response.status,
     hasPocketBase: Boolean(body?.pocketbase?.configured),
+    hasVector: Boolean(body?.vector?.enabled),
+    vectorConfigured: Boolean(body?.vector?.configured),
+    vectorCollection: typeof body?.vector?.collection === 'string' ? body.vector.collection : '',
   };
 }
 
@@ -94,6 +97,7 @@ async function main() {
   const baseUrl = normalizeBaseUrl(
     process.argv[2] || process.env.API_BASE_URL || process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL,
   );
+  const requireVector = ['1', 'true', 'yes', 'on'].includes(String(process.env.REQUIRE_VECTOR || '').trim().toLowerCase());
 
   if (!baseUrl) {
     throw new Error('missing API base URL');
@@ -103,6 +107,12 @@ async function main() {
 
   const health = await checkHealth(baseUrl);
   console.log(`[verify] GET /api/health -> ${health.status}, pocketbase.configured=${health.hasPocketBase}`);
+  console.log(
+    `[verify] vector.enabled=${health.hasVector}, vector.configured=${health.vectorConfigured}${health.vectorCollection ? `, collection=${health.vectorCollection}` : ''}`,
+  );
+  if (requireVector && !health.hasVector) {
+    throw new Error('expected vector.enabled=true in /api/health');
+  }
 
   const chat = await checkChatWithoutToken(baseUrl);
   console.log(`[verify] POST /api/chat (no token) -> ${chat.status}${chat.error ? `, error=${chat.error}` : ''}`);
