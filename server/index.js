@@ -461,6 +461,30 @@ async function upsertVectorMemory(payload) {
   }
 }
 
+async function clearVectorMemoriesForUser(userId) {
+  if (!userId) return false;
+  if (!isVectorConfigured() || shouldSkipVectorTemporarily()) return false;
+
+  const ready = await ensureVectorCollection();
+  if (!ready) return false;
+
+  const collectionPath = `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/delete?wait=true`;
+  try {
+    const { response } = await qdrantRequest('POST', collectionPath, {
+      filter: {
+        must: [{ key: 'userId', match: { value: userId } }],
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`clear vector failed: ${response.status}`);
+    }
+    return true;
+  } catch (error) {
+    scheduleVectorRetry(error?.message || 'clear vector failed');
+    return false;
+  }
+}
+
 function mergeRelevantMemories(baseMemories, vectorMemories) {
   const merged = [];
   const seen = new Set();
@@ -559,20 +583,40 @@ async function persistChatWithTimeout(auth, message, imageDataUrl, modelResult) 
   return Promise.race([persistTask, waitMs(CHAT_PERSIST_TIMEOUT_MS, false)]);
 }
 
+function normalizeIdentityText(value, maxLen = 48) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim().slice(0, maxLen);
+}
+
+function normalizeCompanionGender(value) {
+  const normalized = normalizeIdentityText(value, 12);
+  if (!normalized) return '';
+  const aliases = {
+    male: '男',
+    female: '女',
+    man: '男',
+    woman: '女',
+    m: '男',
+    f: '女',
+  };
+  const lower = normalized.toLowerCase();
+  return aliases[lower] || normalized;
+}
+
+function normalizeCompanionMbti(value) {
+  const normalized = normalizeIdentityText(value, 8).toUpperCase();
+  if (/^[EI][NS][FT][JP](-A|-T)?$/u.test(normalized)) return normalized;
+  return normalized.slice(0, 4);
+}
+
 function normalizeIdentity(identity) {
-  const userName =
-    identity && typeof identity.userName === 'string' && identity.userName.trim()
-      ? identity.userName.trim()
-      : '用户';
-  const companionName =
-    identity && typeof identity.companionName === 'string' && identity.companionName.trim()
-      ? identity.companionName.trim()
-      : '贾维斯';
-  const userBio =
-    identity && typeof identity.userBio === 'string' && identity.userBio.trim()
-      ? identity.userBio.trim()
-      : '';
-  return { userName, companionName, userBio };
+  const userName = normalizeIdentityText(identity?.userName, 32) || '用户';
+  const companionName = normalizeIdentityText(identity?.companionName, 32) || '贾维斯';
+  const companionGender = normalizeCompanionGender(identity?.companionGender);
+  const companionMbti = normalizeCompanionMbti(identity?.companionMbti);
+  const companionProfession = normalizeIdentityText(identity?.companionProfession, 32);
+  const userBio = normalizeIdentityText(identity?.userBio, 280);
+  return { userName, companionName, companionGender, companionMbti, companionProfession, userBio };
 }
 function identityToText(identity) {
   const normalized = normalizeIdentity(identity);
@@ -1052,20 +1096,62 @@ async function loadRecentMessagesForModel(pb, userId, limit = 12) {
   }
 }
 
-function buildSystemPrompt(identity) {
+function hasDeepResponseIntent(text) {
+  if (!text) return false;
+  return /(深度|详细|展开|多说点|多说一些|底层逻辑|剖析|分析一下|深挖|具体讲|完整讲|全面一点|长一点)/u.test(text);
+}
+
+function hasBriefResponseIntent(text) {
+  if (!text) return false;
+  return /(简短|短一点|一句话|简单说|别太长|别啰嗦|精简)/u.test(text);
+}
+
+function detectResponseMode(payload) {
+  const current = normalizeTextForVector(payload?.message || '');
+  if (hasDeepResponseIntent(current)) return 'deep';
+  if (hasBriefResponseIntent(current)) return 'brief';
+
+  const recentUsers = normalizeRecentMessages(payload?.recentMessages || [], 8)
+    .filter((item) => item.role === 'user')
+    .map((item) => item.text)
+    .slice(-2);
+
+  if (recentUsers.some((item) => hasDeepResponseIntent(item))) return 'deep';
+  if (recentUsers.some((item) => hasBriefResponseIntent(item))) return 'brief';
+  return 'normal';
+}
+
+function buildSystemPrompt(identity, responseMode = 'normal') {
   const profile = normalizeIdentity(identity);
   const bioLine = profile.userBio ? `用户自我介绍：${profile.userBio}` : '用户自我介绍：暂未填写';
+  const personaLines = [
+    profile.companionGender ? `性别设定：${profile.companionGender}` : '',
+    profile.companionMbti ? `MBTI设定：${profile.companionMbti}` : '',
+    profile.companionProfession ? `职业设定：${profile.companionProfession}` : '',
+  ].filter(Boolean);
+
+  const modeLine =
+    responseMode === 'deep'
+      ? '当前轮用户明确要深入聊：请给 6-10 句、有结构的分析（可用“先说结论→再拆原因→最后给建议”）。'
+      : responseMode === 'brief'
+        ? '当前轮用户偏好简短：控制在 1-2 句，直接回答，不展开。'
+        : '默认回复长度为 2-4 句，既不敷衍也不过长。';
+
   return [
     `你是 ${profile.companionName}。`,
     `你正在和 ${profile.userName} 聊天。`,
     '你是稳定、克制、真诚的聊天伙伴，目标是把话接住、说人话。',
     bioLine,
+    ...(personaLines.length > 0 ? [`伙伴人设：${personaLines.join('；')}`] : []),
     '只基于用户当前输入和给定上下文回答；不知道就直说，不要编故事。',
     '不要虚构现实动作和场景，不要写舞台腔括号旁白。',
     '不要装熟，不要自称发小/家人/老朋友，不要臆测“上次、昨天、刚才”发生了什么。',
+    '语气要求：亲近但不油腻，真诚但不说教，不要端着“教育用户”的姿态。',
     `用户问“你是谁/你叫什么”时，回答“我是${profile.companionName}，在这里和你聊天”。`,
+    '用户提到专业问题时，优先用职业设定的视角回答；不确定就明确说不确定。',
     '先回应用户这句话本身，再继续对话；不强行推进任务，不说模板口号。',
-    '默认 1-3 句短回复，纯文本，不输出 JSON/代码块（用户明确要求除外）。',
+    modeLine,
+    '纯文本输出，不输出 JSON/代码块（用户明确要求除外）。',
   ].join('\n');
 }
 
@@ -1202,6 +1288,39 @@ function buildFallbackReply(payload) {
   return '我在，接着说。';
 }
 
+function countSentences(text) {
+  return String(text || '')
+    .split(/[。！？!?]/u)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0).length;
+}
+
+function buildDeepFallbackReply(payload) {
+  const topic = normalizeTextForVector(payload?.message || '').slice(0, 30) || '这件事';
+  return [
+    `你这个话题（${topic}）值得认真拆开说。`,
+    '先说结论：你现在更需要的是“被准确理解”，而不是一句空话安慰。',
+    '再看原因：前面体验让你反复觉得它在自说自话，所以你会对敷衍特别敏感。',
+    '可执行建议：我们继续用“你给真实对话→我按问题点逐条修”这套方式，很快能把质感拉上来。',
+  ].join('');
+}
+
+function enforceAssistantQuality(text, payload) {
+  const normalized = String(text || '').trim();
+  if (!normalized) return buildFallbackReply(payload);
+  if (isUnsafeAssistantStyle(normalized)) return buildFallbackReply(payload);
+
+  const responseMode = payload?.responseMode || detectResponseMode(payload);
+  if (responseMode === 'deep') {
+    const sentenceSize = countSentences(normalized);
+    if (normalized.length < 80 || sentenceSize < 3) {
+      return buildDeepFallbackReply(payload);
+    }
+  }
+
+  return normalized;
+}
+
 function normalizeProviderError(provider, status, rawMessage) {
   const message = String(rawMessage || '').trim();
   const lower = message.toLowerCase();
@@ -1234,7 +1353,8 @@ async function callModelWithFailover(payload) {
 
 function buildMessages(payload) {
   const userText = typeof payload.message === 'string' ? payload.message.trim() : '';
-  const systemPrompt = buildSystemPrompt(payload.identity);
+  const responseMode = payload?.responseMode || detectResponseMode(payload);
+  const systemPrompt = buildSystemPrompt(payload.identity, responseMode);
   const memoryHintText = buildMemoryHintText(payload);
   const recentDialogue = buildRecentDialogueMessages(payload);
   const continuityGuard = {
@@ -1315,8 +1435,9 @@ async function chatWithDeepSeek(payload) {
 
   const choice = data?.choices?.[0];
   const assistantText = normalizeAssistantText(choice?.message?.content, payload);
+  const finalReply = enforceAssistantQuality(assistantText || buildFallbackReply(payload), payload);
   return {
-    reply: assistantText || buildFallbackReply(payload),
+    reply: finalReply,
     model,
     usage: data?.usage || null,
   };
@@ -1585,6 +1706,54 @@ app.post('/api/history/delete', async (req, res) => {
   }
 });
 
+app.post('/api/history/clear', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ error: 'missing bearer token' });
+    }
+
+    const auth = await authByToken(token);
+    const ids = [];
+    const pageSize = 200;
+    let page = 1;
+
+    for (let guard = 0; guard < 30; guard += 1) {
+      const list = await withTimeout(
+        auth.pb.collection(PB_CHAT_COLLECTION).getList(page, pageSize, {
+          filter: `user = "${auth.user.id}" && role != "system"`,
+          sort: '-created',
+        }),
+        POCKETBASE_TIMEOUT_MS,
+        'history clear list',
+      );
+
+      const batch = Array.isArray(list?.items) ? list.items.map((item) => item.id).filter(Boolean) : [];
+      ids.push(...batch);
+
+      const totalPages = Number(list?.totalPages || 1);
+      if (page >= totalPages) break;
+      page += 1;
+    }
+
+    let deleted = 0;
+    for (const id of ids) {
+      await withTimeout(
+        auth.pb.collection(PB_CHAT_COLLECTION).delete(id),
+        POCKETBASE_TIMEOUT_MS,
+        'history clear remove',
+      );
+      deleted += 1;
+    }
+
+    const vectorCleared = await clearVectorMemoriesForUser(auth.user.id);
+    return res.json({ deleted, vectorCleared });
+  } catch (error) {
+    const message = error?.response?.message || error?.message || 'history clear failed';
+    return res.status(400).json({ error: message });
+  }
+});
+
 app.get('/api/identity', async (req, res) => {
   try {
     const token = getBearerToken(req);
@@ -1788,6 +1957,10 @@ app.post('/api/chat', async (req, res) => {
       Array.isArray(payload.recentMessages) ? payload.recentMessages : [],
       12,
     );
+    const responseMode = detectResponseMode({
+      message,
+      recentMessages: mergedRecentMessages,
+    });
 
     const payloadForModel = {
       message,
@@ -1804,6 +1977,7 @@ app.post('/api/chat', async (req, res) => {
       todayJournal: payload.todayJournal || null,
       identity: payload.identity || null,
       recentMessages: mergedRecentMessages,
+      responseMode,
     };
     const modelStarted = Date.now();
     const modelResult = await callModelWithFailover(payloadForModel);
