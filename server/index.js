@@ -21,17 +21,16 @@ dotenv.config();
 const app = express();
 
 const PORT = Number(process.env.PORT || 8787);
-const ZHIPU_API_KEY = (process.env.ZHIPU_API_KEY || '').trim();
-const TEXT_MODEL = (process.env.ZHIPU_TEXT_MODEL || 'glm-4.7-flash').trim();
-const VISION_MODEL = (process.env.ZHIPU_VISION_MODEL || 'glm-4.6v-flash').trim();
-const ZHIPU_CHAT_URL = 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
 const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
 const DEEPSEEK_TEXT_MODEL = (process.env.DEEPSEEK_TEXT_MODEL || 'deepseek-chat').trim();
+const DEEPSEEK_VISION_MODEL = (process.env.DEEPSEEK_VISION_MODEL || DEEPSEEK_TEXT_MODEL).trim();
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com').trim().replace(/\/+$/, '');
 const DEEPSEEK_CHAT_URL = `${DEEPSEEK_BASE_URL}/chat/completions`;
 const MODEL_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS || 45000);
+const MODEL_MAX_TOKENS = Number(process.env.MODEL_MAX_TOKENS || 512);
 const CHAT_PERSIST_TIMEOUT_MS = Number(process.env.CHAT_PERSIST_TIMEOUT_MS || 1500);
 const POCKETBASE_TIMEOUT_MS = Number(process.env.POCKETBASE_TIMEOUT_MS || 15000);
+const AUTH_CACHE_TTL_MS = Number(process.env.AUTH_CACHE_TTL_MS || 300000);
 const VECTOR_ENABLED_RAW = (process.env.VECTOR_ENABLED || '').trim().toLowerCase();
 const VECTOR_ENABLED = VECTOR_ENABLED_RAW
   ? ['1', 'true', 'yes', 'on'].includes(VECTOR_ENABLED_RAW)
@@ -42,7 +41,7 @@ const QDRANT_COLLECTION = (process.env.QDRANT_COLLECTION || 'growup_memories').t
 const VECTOR_DIM = Number(process.env.VECTOR_DIM || 384);
 const VECTOR_TOP_K = Number(process.env.VECTOR_TOP_K || 6);
 const VECTOR_TEXT_MAX_CHARS = Number(process.env.VECTOR_TEXT_MAX_CHARS || 1200);
-const VECTOR_TIMEOUT_MS = Number(process.env.VECTOR_TIMEOUT_MS || 6000);
+const VECTOR_TIMEOUT_MS = Number(process.env.VECTOR_TIMEOUT_MS || 1500);
 const VECTOR_BACKOFF_MS = Number(process.env.VECTOR_BACKOFF_MS || 60000);
 const VECTOR_MIN_QUERY_CHARS = Number(process.env.VECTOR_MIN_QUERY_CHARS || 4);
 
@@ -58,6 +57,7 @@ const MEMORY_KIND_STATE = 'state-v1';
 
 let vectorCollectionReady = false;
 let vectorBackoffUntil = 0;
+const authCache = new Map();
 
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
@@ -75,11 +75,40 @@ function getBearerToken(req) {
   return header.slice(7).trim();
 }
 
+function decodeBase64Url(input) {
+  const normalized = String(input || '').replace(/-/g, '+').replace(/_/g, '/');
+  const pad = normalized.length % 4;
+  const padded = pad ? normalized + '='.repeat(4 - pad) : normalized;
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function parseJwtPayload(token) {
+  if (typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const raw = decodeBase64Url(parts[1]);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 function isInternalRecapPrompt(message) {
   const text = typeof message === 'string' ? message.replace(/\s+/g, ' ').trim() : '';
   return text.startsWith('请根据以下聊天记录生成')
     && text.includes('仅返回 JSON')
     && text.includes('"summary"')
+    && text.includes('"important"')
+    && text.includes('"todo"');
+}
+
+function isInternalRecapJsonReply(message) {
+  const text = typeof message === 'string' ? message.trim() : '';
+  if (!text.startsWith('{')) return false;
+  return text.includes('"summary"')
     && text.includes('"important"')
     && text.includes('"todo"');
 }
@@ -122,13 +151,53 @@ function fileUrl(pb, record, field) {
 }
 
 async function authByToken(token) {
+  const now = Date.now();
+  const cached = authCache.get(token);
+  if (cached && cached.expiresAt > now) {
+    const pbCached = createPb();
+    pbCached.authStore.save(token, null);
+    return {
+      pb: pbCached,
+      token,
+      user: cached.user,
+    };
+  }
+
+  const jwtPayload = parseJwtPayload(token);
+  const expMs = Number(jwtPayload?.exp || 0) * 1000;
+  const tokenUserId = String(jwtPayload?.id || jwtPayload?.sub || '').trim();
+  if (tokenUserId && Number.isFinite(expMs) && expMs > now + 5000) {
+    const user = {
+      id: tokenUserId,
+      email: typeof jwtPayload?.email === 'string' ? jwtPayload.email : '',
+      name: typeof jwtPayload?.name === 'string' ? jwtPayload.name : '',
+    };
+    const expiresAt = Math.min(expMs, now + Math.max(30000, AUTH_CACHE_TTL_MS));
+    authCache.set(token, { user, expiresAt });
+
+    const pbFast = createPb();
+    pbFast.authStore.save(token, null);
+    return {
+      pb: pbFast,
+      token,
+      user,
+    };
+  }
+
   const pb = createPb();
   pb.authStore.save(token, null);
   const authData = await withTimeout(pb.collection(PB_USERS_COLLECTION).authRefresh(), POCKETBASE_TIMEOUT_MS, 'auth refresh');
+  const user = authData.record;
+  if (user && user.id) {
+    authCache.set(token, {
+      user,
+      expiresAt: now + Math.max(30000, AUTH_CACHE_TTL_MS),
+    });
+  }
   return {
     pb,
     token: authData.token || token,
-    user: authData.record,
+    user,
   };
 }
 
@@ -811,6 +880,52 @@ function mapMemoryRecord(record) {
   };
 }
 
+function normalizeRecentMessages(items, limit = 12) {
+  if (!Array.isArray(items)) return [];
+  const next = [];
+
+  for (const item of items) {
+    const role = item && item.role === 'assistant' ? 'assistant' : 'user';
+    const text = typeof item?.text === 'string' ? item.text.replace(/\s+/g, ' ').trim() : '';
+    if (!text) continue;
+    if (text === '正在输入...') continue;
+    if (text.startsWith('网络失败：')) continue;
+    if (isInternalRecapPrompt(text) || isInternalRecapJsonReply(text)) continue;
+
+    const clipped = text.slice(0, 600);
+    const prev = next[next.length - 1];
+    if (prev && prev.role === role && prev.text === clipped) continue;
+    next.push({ role, text: clipped });
+  }
+
+  return next.slice(-Math.max(2, limit));
+}
+
+function mergeRecentMessages(remoteMessages, localMessages, limit = 12) {
+  return normalizeRecentMessages([...(remoteMessages || []), ...(localMessages || [])], limit);
+}
+
+async function loadRecentMessagesForModel(pb, userId, limit = 12) {
+  if (!pb || !userId) return [];
+  try {
+    const pageSize = Math.max(6, Math.min(30, limit * 2));
+    const list = await pb.collection(PB_CHAT_COLLECTION).getList(1, pageSize, {
+      filter: `user = "${userId}" && role != "system"`,
+      sort: '-created',
+    });
+    const normalized = list.items
+      .slice()
+      .reverse()
+      .map((item) => ({
+        role: item.role === 'assistant' ? 'assistant' : 'user',
+        text: typeof item.text === 'string' ? item.text : '',
+      }));
+    return normalizeRecentMessages(normalized, limit);
+  } catch {
+    return [];
+  }
+}
+
 function buildSystemPrompt(identity) {
   const profile = normalizeIdentity(identity);
   const bioLine = profile.userBio ? `用户自我介绍：${profile.userBio}` : '用户自我介绍：暂未填写';
@@ -822,6 +937,8 @@ function buildSystemPrompt(identity) {
     '风格要求：自然、真诚、像发小/闺蜜；优先共情和理解，不端着。',
     '禁止事项：不要催用户做计划、不要打卡式提问、不要模板化“今天小成就”之类话术。',
     '禁止措辞：不要说“作为AI”“我是助手”“陪跑”等身份化表达。',
+    '连续对话规则：默认这是同一段持续聊天，禁止无依据说“好久不见”“你终于回来了”。',
+    '情绪优先规则：如果用户说累、困、要睡、难受、崩溃，先接住情绪并允许休息，不要立刻推进任务。',
     '默认策略：先站在用户角度回应，再顺着用户语境继续聊；只有用户主动要建议时再给简短可落地建议。',
     '表达限制：少用空泛鸡汤，不要长篇说教，不要连续追问多个问题。',
     `当你需要表态时，用朋友口吻表达：我愿意做你真实的朋友，会站在你这边。`,
@@ -852,6 +969,16 @@ function buildContextText(payload) {
 
   return `${identityBlock}\n\n${memoryBlock}\n\n${journalBlock}\n\n用户输入：${payload.message || ''}`;
 }
+
+function buildRecentDialogueMessages(payload) {
+  const recentMessages = normalizeRecentMessages(payload.recentMessages, 12);
+  if (recentMessages.length === 0) return [];
+  return recentMessages.map((item) => ({
+    role: item.role,
+    content: item.text,
+  }));
+}
+
 function normalizeAssistantText(content) {
   if (typeof content === 'string') return content.trim();
   if (Array.isArray(content)) {
@@ -868,18 +995,69 @@ function normalizeAssistantText(content) {
   return '';
 }
 
+function buildFallbackReply(payload) {
+  const text = typeof payload?.message === 'string' ? payload.message : '';
+  if (/[睡困晚安休息]/.test(text)) {
+    return '那就先睡吧，晚安。我在，明天再接着聊。';
+  }
+  if (/[累崩溃焦虑难受压力烦]/.test(text)) {
+    return '听到了，你现在不好受。先缓一缓，我在这儿。';
+  }
+  return '我在，接着你刚才的话继续聊。';
+}
+
+function normalizeProviderError(provider, status, rawMessage) {
+  const message = String(rawMessage || '').trim();
+  const lower = message.toLowerCase();
+
+  if (status === 402 || (lower.includes('insufficient') && lower.includes('balance'))) {
+    return `${provider} balance insufficient`;
+  }
+  if (
+    status === 401
+    || lower.includes('invalid api key')
+    || lower.includes('unauthorized')
+    || lower.includes('authentication fails')
+  ) {
+    return `${provider} api key invalid`;
+  }
+  if (status === 429 || lower.includes('rate limit') || lower.includes('too many requests')) {
+    return `${provider} rate limited`;
+  }
+  return message || `${provider} request failed`;
+}
+
+async function callModelWithFailover(payload) {
+  if (!DEEPSEEK_API_KEY) {
+    const error = new Error('DEEPSEEK_API_KEY is missing');
+    error.status = 503;
+    throw error;
+  }
+  return chatWithDeepSeek(payload);
+}
+
 function buildMessages(payload) {
   const contextText = buildContextText(payload);
   const systemPrompt = buildSystemPrompt(payload.identity);
+  const recentDialogue = buildRecentDialogueMessages(payload);
+  const continuityGuard = {
+    role: 'system',
+    content: '你已收到最近对话记录，请承接上一轮语境，不要跳戏，不要凭空说“好久不见”。',
+  };
+
   if (!payload.imageDataUrl) {
     return [
       { role: 'system', content: systemPrompt },
+      ...recentDialogue,
+      continuityGuard,
       { role: 'user', content: contextText },
     ];
   }
 
   return [
     { role: 'system', content: systemPrompt },
+    ...recentDialogue,
+    continuityGuard,
     {
       role: 'user',
       content: [
@@ -896,56 +1074,6 @@ function buildMessages(payload) {
   ];
 }
 
-function buildTextMessages(payload) {
-  const contextText = buildContextText(payload);
-  const systemPrompt = buildSystemPrompt(payload.identity);
-  return [
-    { role: 'system', content: systemPrompt },
-    { role: 'user', content: contextText },
-  ];
-}
-
-async function chatWithZhipu(payload) {
-  if (!ZHIPU_API_KEY) {
-    throw new Error('ZHIPU_API_KEY is missing');
-  }
-  const hasImage = Boolean(payload.imageDataUrl);
-  const model = hasImage ? VISION_MODEL : TEXT_MODEL;
-  const body = {
-    model,
-    messages: buildMessages(payload),
-    temperature: 0.7,
-    max_tokens: 1024,
-  };
-
-  const { response, data } = await fetchJsonWithTimeout(
-    ZHIPU_CHAT_URL,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${ZHIPU_API_KEY}`,
-      },
-      body: JSON.stringify(body),
-    },
-    MODEL_TIMEOUT_MS,
-  );
-  if (!response.ok) {
-    const message = data && data.error && data.error.message ? data.error.message : 'zhipu request failed';
-    const error = new Error(message);
-    error.status = response.status;
-    throw error;
-  }
-
-  const choice = data?.choices?.[0];
-  const assistantText = normalizeAssistantText(choice?.message?.content);
-  return {
-    reply: assistantText || '我收到了，我们继续推进今天的重点。',
-    model,
-    usage: data?.usage || null,
-  };
-}
-
 async function chatWithDeepSeek(payload) {
   if (!DEEPSEEK_API_KEY) {
     const error = new Error('DEEPSEEK_API_KEY is missing');
@@ -953,11 +1081,13 @@ async function chatWithDeepSeek(payload) {
     throw error;
   }
 
+  const hasImage = Boolean(payload.imageDataUrl);
+  const model = hasImage ? DEEPSEEK_VISION_MODEL : DEEPSEEK_TEXT_MODEL;
   const body = {
-    model: DEEPSEEK_TEXT_MODEL,
-    messages: buildTextMessages(payload),
+    model,
+    messages: buildMessages(payload),
     temperature: 0.7,
-    max_tokens: 1024,
+    max_tokens: MODEL_MAX_TOKENS,
     stream: false,
   };
 
@@ -974,7 +1104,11 @@ async function chatWithDeepSeek(payload) {
     MODEL_TIMEOUT_MS,
   );
   if (!response.ok) {
-    const message = data && data.error && data.error.message ? data.error.message : 'deepseek request failed';
+    const message = normalizeProviderError(
+      'deepseek',
+      response.status,
+      data && data.error && data.error.message ? data.error.message : 'deepseek request failed',
+    );
     const error = new Error(message);
     error.status = response.status;
     throw error;
@@ -983,8 +1117,8 @@ async function chatWithDeepSeek(payload) {
   const choice = data?.choices?.[0];
   const assistantText = normalizeAssistantText(choice?.message?.content);
   return {
-    reply: assistantText || '我收到了，我们继续推进今天的重点。',
-    model: DEEPSEEK_TEXT_MODEL,
+    reply: assistantText || buildFallbackReply(payload),
+    model,
     usage: data?.usage || null,
   };
 }
@@ -1032,9 +1166,8 @@ async function saveAssistantMessage(pb, userId, message, model) {
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    hasZhipuKey: Boolean(ZHIPU_API_KEY),
     hasDeepseekKey: Boolean(DEEPSEEK_API_KEY),
-    textProvider: DEEPSEEK_API_KEY ? 'deepseek' : 'zhipu',
+    textProvider: 'deepseek',
     pocketbase: {
       configured: Boolean(PB_URL),
       url: PB_URL || '',
@@ -1053,8 +1186,8 @@ app.get('/api/health', (_req, res) => {
       backoffUntil: vectorBackoffUntil || null,
     },
     model: {
-      text: DEEPSEEK_API_KEY ? DEEPSEEK_TEXT_MODEL : TEXT_MODEL,
-      vision: VISION_MODEL,
+      text: DEEPSEEK_TEXT_MODEL,
+      vision: DEEPSEEK_VISION_MODEL,
     },
   });
 });
@@ -1306,14 +1439,26 @@ app.get('/api/memories', async (req, res) => {
 
 app.post('/api/chat', async (req, res) => {
   try {
+    const startedAt = Date.now();
+    const metrics = {};
+    const checkpoint = (name, from) => {
+      metrics[name] = Date.now() - from;
+    };
+    const shouldDebugTimings =
+      ['1', 'true', 'yes', 'on'].includes(String(process.env.CHAT_DEBUG_TIMINGS || '').trim().toLowerCase())
+      || req.query?.debug === '1'
+      || req.body?.debug === true;
+
     const token = getBearerToken(req);
     if (!token) {
       return res.status(401).json({ error: 'missing bearer token' });
     }
 
     let auth = null;
+    const authStarted = Date.now();
     try {
       auth = await authByToken(token);
+      checkpoint('authMs', authStarted);
     } catch (error) {
       const message = error?.response?.message || error?.message || 'invalid token';
       return res.status(401).json({ error: message });
@@ -1333,16 +1478,31 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'internal recap prompt is not allowed on chat endpoint' });
     }
 
-    const vectorMemories = message
-      ? await searchVectorMemories(auth.user.id, message, VECTOR_TOP_K)
-      : [];
-    let recapMemories = [];
-    try {
-      const state = await readState(auth.pb, auth.user.id);
-      recapMemories = buildRecapMemoriesFromState(state, message, 2);
-    } catch (error) {
-      console.warn(`[recap] read state failed: ${error?.message || 'unknown error'}`);
-    }
+    const contextStarted = Date.now();
+    const [remoteRecentMessages, vectorMemories, recapMemories] = await Promise.all([
+      loadRecentMessagesForModel(auth.pb, auth.user.id, 12),
+      (async () => {
+        if (!message) return [];
+        return searchVectorMemories(auth.user.id, message, VECTOR_TOP_K);
+      })(),
+      (async () => {
+        try {
+          const state = await readState(auth.pb, auth.user.id);
+          return buildRecapMemoriesFromState(state, message, 2);
+        } catch (error) {
+          console.warn(`[recap] read state failed: ${error?.message || 'unknown error'}`);
+          return [];
+        }
+      })(),
+    ]);
+    checkpoint('contextMs', contextStarted);
+
+    const mergedRecentMessages = mergeRecentMessages(
+      remoteRecentMessages,
+      Array.isArray(payload.recentMessages) ? payload.recentMessages : [],
+      12,
+    );
+
     const payloadForModel = {
       message,
       imageDataUrl,
@@ -1355,20 +1515,37 @@ app.post('/api/chat', async (req, res) => {
       ),
       todayJournal: payload.todayJournal || null,
       identity: payload.identity || null,
+      recentMessages: mergedRecentMessages,
     };
-    const modelResult =
-      !imageDataUrl && DEEPSEEK_API_KEY
-        ? await chatWithDeepSeek(payloadForModel)
-        : await chatWithZhipu(payloadForModel);
+    const modelStarted = Date.now();
+    const modelResult = await callModelWithFailover(payloadForModel);
+    checkpoint('modelMs', modelStarted);
 
+    const persistStarted = Date.now();
     const persisted = await persistChatWithTimeout(auth, message, imageDataUrl, modelResult);
+    checkpoint('persistMs', persistStarted);
+    checkpoint('totalMs', startedAt);
 
-    return res.json({
+    if (shouldDebugTimings) {
+      res.setHeader('x-chat-total-ms', String(metrics.totalMs || 0));
+      res.setHeader('x-chat-auth-ms', String(metrics.authMs || 0));
+      res.setHeader('x-chat-context-ms', String(metrics.contextMs || 0));
+      res.setHeader('x-chat-model-ms', String(metrics.modelMs || 0));
+      res.setHeader('x-chat-persist-ms', String(metrics.persistMs || 0));
+    }
+
+    const responseBody = {
       reply: modelResult.reply,
       model: modelResult.model,
       usage: modelResult.usage,
       persisted,
-    });
+    };
+    if (shouldDebugTimings) {
+      responseBody.timings = metrics;
+      responseBody.provider = 'deepseek';
+    }
+
+    return res.json(responseBody);
   } catch (error) {
     const status = Number(error.status || 502);
     const message = error?.response?.message || error?.message || 'chat failed';
@@ -1380,7 +1557,7 @@ if (!process.env.VERCEL) {
   app.listen(PORT, () => {
     console.log(`[growup-server] listening on http://localhost:${PORT}`);
     console.log(
-      `[growup-server] zhipu=${ZHIPU_API_KEY ? 'configured' : 'missing'} deepseek=${DEEPSEEK_API_KEY ? 'configured' : 'missing'} text=${DEEPSEEK_API_KEY ? DEEPSEEK_TEXT_MODEL : TEXT_MODEL} vision=${VISION_MODEL}`,
+      `[growup-server] deepseek=${DEEPSEEK_API_KEY ? 'configured' : 'missing'} text=${DEEPSEEK_TEXT_MODEL} vision=${DEEPSEEK_VISION_MODEL}`,
     );
     console.log(`[growup-server] pocketbase=${PB_URL ? PB_URL : 'missing'} users=${PB_USERS_COLLECTION} chats=${PB_CHAT_COLLECTION}`);
     console.log(
