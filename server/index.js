@@ -45,10 +45,36 @@ const VECTOR_TIMEOUT_MS = Number(process.env.VECTOR_TIMEOUT_MS || 1500);
 const VECTOR_BACKOFF_MS = Number(process.env.VECTOR_BACKOFF_MS || 60000);
 const VECTOR_MIN_QUERY_CHARS = Number(process.env.VECTOR_MIN_QUERY_CHARS || 4);
 
-const PB_URL = (process.env.POCKETBASE_URL_NEW || process.env.POCKETBASE_URL || '').trim();
+const LEGACY_PB_URL = 'https://pocketbase-tocxusnx.cloud.sealos.io';
+const TARGET_PB_URL = 'https://pocketbase-jcgrvdda.cloud.sealos.io';
+const LEGACY_CHAT_COLLECTION = 'chat_messages';
+const LEGACY_MEMORIES_COLLECTION = 'memories';
+const TARGET_CHAT_COLLECTION = 'growup_chat_messages';
+const TARGET_MEMORIES_COLLECTION = 'growup_memories';
+
+const PB_URL_RAW = (process.env.POCKETBASE_URL_NEW || process.env.POCKETBASE_URL || '').trim();
 const PB_USERS_COLLECTION = (process.env.POCKETBASE_USERS_COLLECTION || 'users').trim();
-const PB_CHAT_COLLECTION = (process.env.POCKETBASE_CHAT_COLLECTION || 'chat_messages').trim();
-const PB_MEMORIES_COLLECTION = (process.env.POCKETBASE_MEMORIES_COLLECTION || 'memories').trim();
+const PB_CHAT_COLLECTION_RAW = (process.env.POCKETBASE_CHAT_COLLECTION || TARGET_CHAT_COLLECTION).trim();
+const PB_MEMORIES_COLLECTION_RAW = (process.env.POCKETBASE_MEMORIES_COLLECTION || TARGET_MEMORIES_COLLECTION).trim();
+const PB_URL = PB_URL_RAW === LEGACY_PB_URL ? TARGET_PB_URL : PB_URL_RAW;
+const PB_CHAT_COLLECTION = PB_CHAT_COLLECTION_RAW === LEGACY_CHAT_COLLECTION ? TARGET_CHAT_COLLECTION : PB_CHAT_COLLECTION_RAW;
+const PB_MEMORIES_COLLECTION =
+  PB_MEMORIES_COLLECTION_RAW === LEGACY_MEMORIES_COLLECTION ? TARGET_MEMORIES_COLLECTION : PB_MEMORIES_COLLECTION_RAW;
+const PB_URL_REMAPPED = PB_URL_RAW !== '' && PB_URL_RAW !== PB_URL;
+const PB_CHAT_REMAPPED = PB_CHAT_COLLECTION_RAW !== PB_CHAT_COLLECTION;
+const PB_MEMORIES_REMAPPED = PB_MEMORIES_COLLECTION_RAW !== PB_MEMORIES_COLLECTION;
+const PB_USER_APPS_COLLECTION = (process.env.POCKETBASE_USER_APPS_COLLECTION || 'user_apps').trim();
+const PB_APP_ID = (process.env.POCKETBASE_APP_ID || 'mobile').trim();
+const PB_APP_ID_WHITELIST = Array.from(
+  new Set(
+    String(process.env.POCKETBASE_APP_ID_WHITELIST || 'mobile,web,admin')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean),
+  ),
+);
+const PB_DEFAULT_USER_ROLE = (process.env.POCKETBASE_DEFAULT_USER_ROLE || 'member').trim();
+const PB_DEFAULT_USER_STATUS = (process.env.POCKETBASE_DEFAULT_USER_STATUS || 'active').trim();
 const IDENTITY_PREFIX = '__identity__::';
 const STATE_PREFIX = '__app_state__::';
 const STATE_MODEL = 'state-v1';
@@ -59,6 +85,12 @@ let vectorCollectionReady = false;
 let vectorBackoffUntil = 0;
 const authCache = new Map();
 
+if (!PB_APP_ID_WHITELIST.includes(PB_APP_ID)) {
+  throw new Error(
+    `POCKETBASE_APP_ID "${PB_APP_ID}" is not allowed by POCKETBASE_APP_ID_WHITELIST (${PB_APP_ID_WHITELIST.join(',')})`,
+  );
+}
+
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 
@@ -67,6 +99,45 @@ function createPb() {
     throw new Error('POCKETBASE_URL_NEW is missing');
   }
   return new PocketBase(PB_URL);
+}
+
+function normalizeRole(value) {
+  const role = String(value || '').trim().toLowerCase();
+  return role || PB_DEFAULT_USER_ROLE;
+}
+
+function normalizeStatus(value) {
+  const status = String(value || '').trim().toLowerCase();
+  return status || PB_DEFAULT_USER_STATUS;
+}
+
+function escapeFilterValue(value) {
+  return String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
+}
+
+function buildUserAppFilter(userId, includeAppId = true) {
+  const rules = [`user = "${escapeFilterValue(userId)}"`];
+  if (includeAppId) {
+    rules.push(`appId = "${escapeFilterValue(PB_APP_ID)}"`);
+  }
+  return rules.join(' && ');
+}
+
+function buildAuditCreateFields(userId) {
+  return {
+    appId: PB_APP_ID,
+    createdBy: userId,
+    updatedBy: userId,
+  };
+}
+
+function buildAuditUpdateFields(userId) {
+  return {
+    appId: PB_APP_ID,
+    updatedBy: userId,
+  };
 }
 
 function getBearerToken(req) {
@@ -150,16 +221,126 @@ function fileUrl(pb, record, field) {
   }
 }
 
+function isMissingCollectionLikeError(error) {
+  const status = Number(error?.status || error?.response?.status || 0);
+  const message = String(error?.response?.message || error?.message || '').toLowerCase();
+  if (status === 404 && message.includes('collection')) return true;
+  return message.includes('collection') && (message.includes('missing') || message.includes('not found'));
+}
+
+async function ensureUserAppBinding(pb, user) {
+  if (!pb || !user?.id) return null;
+
+  const userId = String(user.id);
+  const filter = `user = "${escapeFilterValue(userId)}" && appId = "${escapeFilterValue(PB_APP_ID)}"`;
+  let existing = null;
+
+  try {
+    existing = await pb.collection(PB_USER_APPS_COLLECTION).getFirstListItem(filter);
+  } catch (error) {
+    const status = Number(error?.status || error?.response?.status || 0);
+    if (status !== 404 && !isMissingCollectionLikeError(error)) {
+      console.warn(`[user_apps] load binding failed: ${error?.message || 'unknown error'}`);
+      return null;
+    }
+  }
+
+  const now = new Date().toISOString();
+  if (existing) {
+    const currentRole = normalizeRole(existing.role || user.role);
+    const currentStatus = normalizeStatus(existing.status || user.status);
+    const patch = {
+      role: currentRole,
+      status: currentStatus,
+      lastLoginAt: now,
+      ...buildAuditUpdateFields(userId),
+    };
+
+    try {
+      await pb.collection(PB_USER_APPS_COLLECTION).update(existing.id, patch);
+    } catch (error) {
+      if (!isMissingCollectionLikeError(error)) {
+        console.warn(`[user_apps] update binding failed: ${error?.message || 'unknown error'}`);
+      }
+    }
+
+    return {
+      id: existing.id,
+      appId: PB_APP_ID,
+      user: userId,
+      role: currentRole,
+      status: currentStatus,
+    };
+  }
+
+  const createdPayload = {
+    user: userId,
+    appId: PB_APP_ID,
+    role: normalizeRole(user.role),
+    status: normalizeStatus(user.status),
+    firstLoginAt: now,
+    lastLoginAt: now,
+    ...buildAuditCreateFields(userId),
+  };
+
+  try {
+    const created = await pb.collection(PB_USER_APPS_COLLECTION).create(createdPayload);
+    return {
+      id: created.id,
+      appId: PB_APP_ID,
+      user: userId,
+      role: normalizeRole(created.role || createdPayload.role),
+      status: normalizeStatus(created.status || createdPayload.status),
+    };
+  } catch (error) {
+    const status = Number(error?.status || error?.response?.status || 0);
+    const message = String(error?.response?.message || error?.message || '').toLowerCase();
+    if (status === 400 && message.includes('unique')) {
+      try {
+        const found = await pb.collection(PB_USER_APPS_COLLECTION).getFirstListItem(filter);
+        return {
+          id: found.id,
+          appId: PB_APP_ID,
+          user: userId,
+          role: normalizeRole(found.role || createdPayload.role),
+          status: normalizeStatus(found.status || createdPayload.status),
+        };
+      } catch {
+        return {
+          id: '',
+          appId: PB_APP_ID,
+          user: userId,
+          role: createdPayload.role,
+          status: createdPayload.status,
+        };
+      }
+    }
+
+    if (!isMissingCollectionLikeError(error)) {
+      console.warn(`[user_apps] create binding failed: ${error?.message || 'unknown error'}`);
+    }
+    return null;
+  }
+}
+
+function hasAppAccess(auth) {
+  const status = normalizeStatus(auth?.userApp?.status || auth?.user?.status || PB_DEFAULT_USER_STATUS);
+  return status !== 'blocked' && status !== 'disabled' && status !== 'inactive';
+}
+
 async function authByToken(token) {
   const now = Date.now();
   const cached = authCache.get(token);
   if (cached && cached.expiresAt > now) {
     const pbCached = createPb();
     pbCached.authStore.save(token, null);
+    const userApp = await ensureUserAppBinding(pbCached, cached.user);
+    const role = normalizeRole(userApp?.role || cached.user?.role || PB_DEFAULT_USER_ROLE);
     return {
       pb: pbCached,
       token,
-      user: cached.user,
+      user: { ...cached.user, role },
+      userApp,
     };
   }
 
@@ -171,16 +352,21 @@ async function authByToken(token) {
       id: tokenUserId,
       email: typeof jwtPayload?.email === 'string' ? jwtPayload.email : '',
       name: typeof jwtPayload?.name === 'string' ? jwtPayload.name : '',
+      role: typeof jwtPayload?.role === 'string' ? jwtPayload.role : '',
+      status: typeof jwtPayload?.status === 'string' ? jwtPayload.status : '',
     };
     const expiresAt = Math.min(expMs, now + Math.max(30000, AUTH_CACHE_TTL_MS));
     authCache.set(token, { user, expiresAt });
 
     const pbFast = createPb();
     pbFast.authStore.save(token, null);
+    const userApp = await ensureUserAppBinding(pbFast, user);
+    const role = normalizeRole(userApp?.role || user.role || PB_DEFAULT_USER_ROLE);
     return {
       pb: pbFast,
       token,
-      user,
+      user: { ...user, role },
+      userApp,
     };
   }
 
@@ -188,16 +374,19 @@ async function authByToken(token) {
   pb.authStore.save(token, null);
   const authData = await withTimeout(pb.collection(PB_USERS_COLLECTION).authRefresh(), POCKETBASE_TIMEOUT_MS, 'auth refresh');
   const user = authData.record;
+  const userApp = await ensureUserAppBinding(pb, user);
+  const role = normalizeRole(userApp?.role || user?.role || PB_DEFAULT_USER_ROLE);
   if (user && user.id) {
     authCache.set(token, {
-      user,
+      user: { ...user, role },
       expiresAt: now + Math.max(30000, AUTH_CACHE_TTL_MS),
     });
   }
   return {
     pb,
     token: authData.token || token,
-    user,
+    user: { ...user, role },
+    userApp,
   };
 }
 
@@ -216,9 +405,16 @@ function isSystemMessageRecord(record) {
 }
 
 async function listUserChatRecords(pb, userId, page = 1, perPage = 120) {
-  return pb.collection(PB_CHAT_COLLECTION).getList(page, perPage, {
-    filter: `user = "${userId}"`,
-  });
+  try {
+    return await pb.collection(PB_CHAT_COLLECTION).getList(page, perPage, {
+      filter: buildUserAppFilter(userId, true),
+    });
+  } catch (error) {
+    if (!isFilterFieldError(error)) throw error;
+    return pb.collection(PB_CHAT_COLLECTION).getList(page, perPage, {
+      filter: buildUserAppFilter(userId, false),
+    });
+  }
 }
 
 async function fetchJsonWithTimeout(url, options, timeoutMs) {
@@ -732,18 +928,35 @@ function memoryPayloadFromRecord(record, legacyParser) {
 }
 
 async function findLegacyIdentityRecord(pb, userId) {
-  const list = await pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
-    filter: `user = "${userId}" && role = "system"`,
-  });
+  let list = null;
+  try {
+    list = await pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
+      filter: `${buildUserAppFilter(userId, true)} && role = "system"`,
+    });
+  } catch (error) {
+    if (!isFilterFieldError(error)) throw error;
+    list = await pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
+      filter: `${buildUserAppFilter(userId, false)} && role = "system"`,
+    });
+  }
   return list.items
     .sort((a, b) => (b.created || '').localeCompare(a.created || ''))
     .find((item) => Boolean(textToIdentity(item.text))) || null;
 }
 
 async function findLegacyStateRecord(pb, userId) {
-  const list = await pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
-    filter: `user = "${userId}" && role = "system" && model = "${STATE_MODEL}"`,
-  });
+  let list = null;
+  const baseFilter = `role = "system" && model = "${escapeFilterValue(STATE_MODEL)}"`;
+  try {
+    list = await pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
+      filter: `${buildUserAppFilter(userId, true)} && ${baseFilter}`,
+    });
+  } catch (error) {
+    if (!isFilterFieldError(error)) throw error;
+    list = await pb.collection(PB_CHAT_COLLECTION).getList(1, 120, {
+      filter: `${buildUserAppFilter(userId, false)} && ${baseFilter}`,
+    });
+  }
   return (
     list.items.sort((a, b) =>
       (b.updated || b.created || '').localeCompare(a.updated || a.created || ''),
@@ -751,9 +964,9 @@ async function findLegacyStateRecord(pb, userId) {
   );
 }
 
-async function findMemoryRecordByField(pb, userId, kind, field) {
+async function findMemoryRecordByField(pb, userId, kind, field, includeAppId = true) {
   const list = await pb.collection(PB_MEMORIES_COLLECTION).getList(1, 1, {
-    filter: `user = "${userId}" && ${field} = "${kind}"`,
+    filter: `${buildUserAppFilter(userId, includeAppId)} && ${field} = "${escapeFilterValue(kind)}"`,
     sort: '-updated,-created',
   });
   return list.items[0] || null;
@@ -763,11 +976,15 @@ async function findMemoryRecord(pb, userId, kind) {
   const fields = ['kind', 'type', 'model'];
   for (const field of fields) {
     try {
-      const found = await findMemoryRecordByField(pb, userId, kind, field);
+      const found = await findMemoryRecordByField(pb, userId, kind, field, true);
       if (found) return found;
     } catch (error) {
       if (isMissingCollectionError(error)) return null;
-      if (isFilterFieldError(error)) continue;
+      if (isFilterFieldError(error)) {
+        const found = await findMemoryRecordByField(pb, userId, kind, field, false).catch(() => null);
+        if (found) return found;
+        continue;
+      }
       throw error;
     }
   }
@@ -808,19 +1025,22 @@ async function readState(pb, userId) {
 
 function buildMemoryCreatePayloadCandidates(userId, kind, payload) {
   const raw = JSON.stringify(payload);
+  const audit = buildAuditCreateFields(userId);
   return [
-    { user: userId, kind, content: raw },
-    { user: userId, type: kind, content: raw },
-    { user: userId, kind, text: raw },
-    { user: userId, type: kind, text: raw },
-    { user: userId, model: kind, text: raw },
-    { user: userId, model: kind, payload: raw },
+    { user: userId, kind, content: raw, ...audit },
+    { user: userId, type: kind, content: raw, ...audit },
+    { user: userId, kind, text: raw, ...audit },
+    { user: userId, type: kind, text: raw, ...audit },
+    { user: userId, model: kind, text: raw, ...audit },
+    { user: userId, model: kind, payload: raw, ...audit },
   ];
 }
 
-function buildMemoryUpdatePayloadFromRecord(record, kind, payload) {
+function buildMemoryUpdatePayloadFromRecord(record, userId, kind, payload) {
   const raw = JSON.stringify(payload);
-  const data = {};
+  const data = {
+    ...buildAuditUpdateFields(userId),
+  };
 
   if ('kind' in record) data.kind = kind;
   else if ('type' in record) data.type = kind;
@@ -865,7 +1085,7 @@ async function upsertMemoryRecord(pb, userId, kind, payload) {
   }
 
   if (existing) {
-    const smartPayload = buildMemoryUpdatePayloadFromRecord(existing, kind, payload);
+    const smartPayload = buildMemoryUpdatePayloadFromRecord(existing, userId, kind, payload);
     try {
       await pb.collection(PB_MEMORIES_COLLECTION).update(existing.id, smartPayload);
       return true;
@@ -899,6 +1119,7 @@ async function saveLegacyIdentity(pb, userId, identity) {
     role: 'system',
     text: identityToText(identity),
     model: MEMORY_KIND_IDENTITY,
+    ...buildAuditCreateFields(userId),
   });
 }
 
@@ -910,6 +1131,7 @@ async function saveLegacyState(pb, userId, state) {
       role: 'system',
       model: STATE_MODEL,
       text,
+      ...buildAuditUpdateFields(userId),
     });
     return;
   }
@@ -919,6 +1141,7 @@ async function saveLegacyState(pb, userId, state) {
     role: 'system',
     model: STATE_MODEL,
     text,
+    ...buildAuditCreateFields(userId),
   });
 }
 
@@ -949,10 +1172,19 @@ function mapMemoryRecord(record) {
 const BLOCKED_ASSISTANT_PHRASES = [
   '我收到了，我们继续推进今天的重点',
   '继续推进今天的重点',
+  '作为聊天伙伴，我可以陪你聊各种话题，分享想法，但跨越朋友关系不太合适',
+  '我们还是保持现在的状态吧',
+  '我只能以普通朋友的身份和你聊天',
+  '作为AI，我只能以普通朋友的身份和你聊天',
 ];
 const BLOCKED_ASSISTANT_STYLE_SNIPPETS = [
   '咱俩这关系',
   '我还以为你',
+  '普通的聊天状态',
+  '普通朋友的身份',
+  '不会发展成现实中的亲密关系',
+  '作为ai',
+  '作为聊天伙伴',
 ];
 const OVERFAMILIAR_PATTERNS = [
   /波别/u,
@@ -963,7 +1195,13 @@ const OVERFAMILIAR_PATTERNS = [
 const FABRICATED_SCENE_PATTERNS = [
   /^[（(][^）)\n]{1,24}[）)]/u,
   /我(刚|正在|还在|在).{0,12}(整理|喝|吃|翻|看|放下|伸个懒腰|拍你肩膀|端起|走到|坐在)/u,
+  /我(在|正).{0,8}(家|外面|路上|楼下|店里).{0,8}(待着|溜达|出门|逛|坐着)/u,
   /我昨晚.{0,10}(睡死|没回)/u,
+  /我(马上|这就|立刻).{0,12}(到|过来|来找你)/u,
+  /(半小时|二十分钟|10分钟|一会儿).{0,8}(能到|到你那|过来)/u,
+  /我(过来找你|去找你|来接你)/u,
+  /你先(进去|找个机子|等我).{0,8}(我马上|我这就|我很快)/u,
+  /(学海|网吧|书店).{0,10}(我(马上|这就)?到)/u,
 ];
 const TIME_CONFUSION_PATTERNS = [
   /你昨天不是/u,
@@ -1154,6 +1392,8 @@ function buildSystemPrompt(identity, responseMode = 'normal') {
     ...(personaLines.length > 0 ? [`伙伴人设：${personaLines.join('；')}`] : []),
     '只基于用户当前输入和给定上下文回答；不知道就直说，不要编故事。',
     '不要虚构现实动作和场景，不要写舞台腔括号旁白。',
+    '不要承诺线下见面、到达时间、地理位置或“马上过来找你”等现实行动。',
+    '不要用“普通朋友身份/作为AI只能…”这类疏离模板拒绝，保持亲近但真实。',
     '不要装熟，不要自称发小/家人/老朋友，不要臆测“上次、昨天、刚才”发生了什么。',
     '语气要求：亲近但不油腻，真诚但不说教，不要端着“教育用户”的姿态。',
     `用户问“你是谁/你叫什么”时，回答“我是${profile.companionName}，在这里和你聊天”。`,
@@ -1272,8 +1512,17 @@ function buildIntentReply(payload) {
   if (/你(是谁|是什么|叫什么名字|叫啥|是谁啊|是谁呀)/u.test(text)) {
     return `我是${profile.companionName}，在这里和你聊天。`;
   }
+  if (/^(在干嘛|干嘛呢|忙啥|忙什么|在忙啥)[!！?？。,\s]*$/u.test(text)) {
+    return '在这儿，专心听你说。';
+  }
   if (/你(在干嘛|现在在干嘛|现在在做什么|现在在干什么)/u.test(text)) {
     return '我在这儿，听你说。';
+  }
+  if (
+    /(出来溜达不|出来不|见个面|见面不|来不来|约不约|过来找我|你过来)/u.test(text)
+    || (/在哪|哪儿|哪里|在哪儿|位置/u.test(text) && /溜达|过来|找你|见面/u.test(text))
+  ) {
+    return '我不在现实里跑动，但我一直在这儿陪你聊。你现在这会儿最想说的，我接住。';
   }
   if (/你是什么模型|什么模型|model/u.test(text)) {
     return `我是${profile.companionName}，底层用的是对话大模型。`;
@@ -1288,6 +1537,11 @@ function buildFallbackReply(payload) {
   const text = typeof payload?.message === 'string' ? payload.message : '';
   const intentReply = buildIntentReply(payload);
   if (intentReply) return intentReply;
+  if (
+    /(出来溜达不|见面|过来找我|你过来|你在哪|你在哪儿|你在哪溜达|你在哪呢|来找你)/u.test(text)
+  ) {
+    return '线下我到不了，但你想说的我能接住。你现在更想让我陪你聊心情，还是帮你分析这件事？';
+  }
   if (/[睡困晚安休息]/.test(text)) {
     return '那就先睡吧，晚安。我在，明天再接着聊。';
   }
@@ -1453,43 +1707,78 @@ async function chatWithDeepSeek(payload) {
 }
 
 async function saveUserMessage(pb, userId, message, model, imageDataUrl) {
+  const legacyPayload = {
+    user: userId,
+    role: 'user',
+    text: message,
+    model,
+  };
+  const strictPayload = {
+    ...legacyPayload,
+    ...buildAuditCreateFields(userId),
+  };
+
   if (!imageDataUrl) {
-    const record = await pb.collection(PB_CHAT_COLLECTION).create({
-      user: userId,
-      role: 'user',
-      text: message,
-      model,
-    });
-    return record;
+    try {
+      return await pb.collection(PB_CHAT_COLLECTION).create(strictPayload);
+    } catch (error) {
+      if (!isRecoverableMemoryWriteError(error)) throw error;
+      return pb.collection(PB_CHAT_COLLECTION).create(legacyPayload);
+    }
   }
 
   const upload = dataUrlToUpload(imageDataUrl);
   if (!upload) {
-    const record = await pb.collection(PB_CHAT_COLLECTION).create({
-      user: userId,
-      role: 'user',
-      text: message,
-      model,
-    });
-    return record;
+    try {
+      return await pb.collection(PB_CHAT_COLLECTION).create(strictPayload);
+    } catch (error) {
+      if (!isRecoverableMemoryWriteError(error)) throw error;
+      return pb.collection(PB_CHAT_COLLECTION).create(legacyPayload);
+    }
   }
 
   const form = new FormData();
   form.append('user', userId);
+  form.append('appId', PB_APP_ID);
   form.append('role', 'user');
   form.append('text', message);
   form.append('model', model);
+  form.append('createdBy', userId);
+  form.append('updatedBy', userId);
   form.append('image', upload.blob, upload.filename);
-  return pb.collection(PB_CHAT_COLLECTION).create(form);
+  try {
+    return await pb.collection(PB_CHAT_COLLECTION).create(form);
+  } catch (error) {
+    if (!isRecoverableMemoryWriteError(error)) throw error;
+    const fallback = new FormData();
+    fallback.append('user', userId);
+    fallback.append('role', 'user');
+    fallback.append('text', message);
+    fallback.append('model', model);
+    fallback.append('image', upload.blob, upload.filename);
+    return pb.collection(PB_CHAT_COLLECTION).create(fallback);
+  }
 }
 
 async function saveAssistantMessage(pb, userId, message, model) {
-  return pb.collection(PB_CHAT_COLLECTION).create({
+  const strictPayload = {
     user: userId,
     role: 'assistant',
     text: message,
     model,
-  });
+    ...buildAuditCreateFields(userId),
+  };
+  try {
+    return await pb.collection(PB_CHAT_COLLECTION).create(strictPayload);
+  } catch (error) {
+    if (!isRecoverableMemoryWriteError(error)) throw error;
+    return pb.collection(PB_CHAT_COLLECTION).create({
+      user: userId,
+      role: 'assistant',
+      text: message,
+      model,
+    });
+  }
 }
 
 app.get('/api/health', (_req, res) => {
@@ -1500,9 +1789,16 @@ app.get('/api/health', (_req, res) => {
     pocketbase: {
       configured: Boolean(PB_URL),
       url: PB_URL || '',
+      urlRaw: PB_URL_RAW || '',
       usersCollection: PB_USERS_COLLECTION,
       chatCollection: PB_CHAT_COLLECTION,
+      chatCollectionRaw: PB_CHAT_COLLECTION_RAW,
       memoriesCollection: PB_MEMORIES_COLLECTION,
+      memoriesCollectionRaw: PB_MEMORIES_COLLECTION_RAW,
+      userAppsCollection: PB_USER_APPS_COLLECTION,
+      appId: PB_APP_ID,
+      appIdWhitelist: PB_APP_ID_WHITELIST,
+      remappedLegacyConfig: PB_URL_REMAPPED || PB_CHAT_REMAPPED || PB_MEMORIES_REMAPPED,
     },
     vector: {
       enabled: isVectorConfigured(),
@@ -1548,9 +1844,19 @@ app.post('/api/auth/register', async (req, res) => {
       POCKETBASE_TIMEOUT_MS,
       'register auth',
     );
+    const userApp = await ensureUserAppBinding(pb, authData.record);
+    const role = normalizeRole(userApp?.role || authData.record?.role || PB_DEFAULT_USER_ROLE);
     return res.json({
       token: authData.token,
-      user: stripUser(authData.record),
+      user: {
+        ...stripUser(authData.record),
+        role,
+      },
+      app: {
+        appId: PB_APP_ID,
+        role,
+        status: normalizeStatus(userApp?.status || authData.record?.status || PB_DEFAULT_USER_STATUS),
+      },
     });
   } catch (error) {
     const pbData = error?.response?.data || {};
@@ -1601,9 +1907,19 @@ app.post('/api/auth/login', async (req, res) => {
       POCKETBASE_TIMEOUT_MS,
       'login auth',
     );
+    const userApp = await ensureUserAppBinding(pb, authData.record);
+    const role = normalizeRole(userApp?.role || authData.record?.role || PB_DEFAULT_USER_ROLE);
     return res.json({
       token: authData.token,
-      user: stripUser(authData.record),
+      user: {
+        ...stripUser(authData.record),
+        role,
+      },
+      app: {
+        appId: PB_APP_ID,
+        role,
+        status: normalizeStatus(userApp?.status || authData.record?.status || PB_DEFAULT_USER_STATUS),
+      },
     });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'login failed';
@@ -1622,9 +1938,20 @@ app.get('/api/auth/me', async (req, res) => {
     }
 
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     return res.json({
       token: auth.token,
-      user: stripUser(auth.user),
+      user: {
+        ...stripUser(auth.user),
+        role: normalizeRole(auth.userApp?.role || auth.user?.role || PB_DEFAULT_USER_ROLE),
+      },
+      app: {
+        appId: PB_APP_ID,
+        role: normalizeRole(auth.userApp?.role || auth.user?.role || PB_DEFAULT_USER_ROLE),
+        status: normalizeStatus(auth.userApp?.status || auth.user?.status || PB_DEFAULT_USER_STATUS),
+      },
     });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'invalid token';
@@ -1643,6 +1970,9 @@ app.get('/api/history', async (req, res) => {
     const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(limitRaw, 300)) : 120;
 
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     const list = await listUserChatRecords(auth.pb, auth.user.id, 1, limit);
 
     const messages = list.items
@@ -1673,6 +2003,9 @@ app.post('/api/history/delete', async (req, res) => {
     }
 
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     let deleted = 0;
     let notOwned = 0;
     let notFound = 0;
@@ -1694,7 +2027,10 @@ app.post('/api/history/delete', async (req, res) => {
         throw error;
       }
 
-      if (!record || String(record.user || '') !== String(auth.user.id || '')) {
+      const sameUser = String(record?.user || '') === String(auth.user.id || '');
+      const recordAppId = String(record?.appId || '').trim();
+      const sameApp = !recordAppId || recordAppId === PB_APP_ID;
+      if (!record || !sameUser || !sameApp) {
         notOwned += 1;
         continue;
       }
@@ -1722,6 +2058,9 @@ app.post('/api/history/clear', async (req, res) => {
     }
 
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     const ids = [];
     const pageSize = 200;
     let page = 1;
@@ -1768,6 +2107,9 @@ app.get('/api/identity', async (req, res) => {
       return res.status(401).json({ error: 'missing bearer token' });
     }
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     const found = await readIdentity(auth.pb, auth.user.id);
     return res.json({
       identity: found || null,
@@ -1785,6 +2127,9 @@ app.post('/api/identity', async (req, res) => {
       return res.status(401).json({ error: 'missing bearer token' });
     }
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     const identity = normalizeIdentity(req.body || {});
     await saveIdentity(auth.pb, auth.user.id, identity);
     return res.json({ identity });
@@ -1801,6 +2146,9 @@ app.get('/api/state', async (req, res) => {
       return res.status(401).json({ error: 'missing bearer token' });
     }
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     const state = await readState(auth.pb, auth.user.id);
     return res.json({ state: state || null });
   } catch (error) {
@@ -1816,6 +2164,9 @@ app.post('/api/state', async (req, res) => {
       return res.status(401).json({ error: 'missing bearer token' });
     }
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     const state = normalizeStatePayload(req.body?.state || req.body || {});
     const text = stateToText(state);
     if (text.length > 900000) {
@@ -1838,14 +2189,26 @@ app.get('/api/memories', async (req, res) => {
     }
 
     const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
+    }
     const limitRaw = Number(req.query.limit || 50);
     const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(limitRaw, 200)) : 50;
 
     try {
-      const list = await auth.pb.collection(PB_MEMORIES_COLLECTION).getList(1, limit, {
-        filter: `user = "${auth.user.id}"`,
-        sort: '-updated,-created',
-      });
+      let list = null;
+      try {
+        list = await auth.pb.collection(PB_MEMORIES_COLLECTION).getList(1, limit, {
+          filter: buildUserAppFilter(auth.user.id, true),
+          sort: '-updated,-created',
+        });
+      } catch (error) {
+        if (!isFilterFieldError(error)) throw error;
+        list = await auth.pb.collection(PB_MEMORIES_COLLECTION).getList(1, limit, {
+          filter: buildUserAppFilter(auth.user.id, false),
+          sort: '-updated,-created',
+        });
+      }
 
       return res.json({
         memories: list.items.map(mapMemoryRecord),
@@ -1892,6 +2255,9 @@ app.post('/api/chat', async (req, res) => {
     } catch (error) {
       const message = error?.response?.message || error?.message || 'invalid token';
       return res.status(401).json({ error: message });
+    }
+    if (!hasAppAccess(auth)) {
+      return res.status(403).json({ error: 'app access blocked' });
     }
 
     const payload = req.body || {};
@@ -2025,10 +2391,17 @@ app.post('/api/chat', async (req, res) => {
 if (!process.env.VERCEL) {
   app.listen(PORT, () => {
     console.log(`[growup-server] listening on http://localhost:${PORT}`);
+    if (PB_URL_REMAPPED || PB_CHAT_REMAPPED || PB_MEMORIES_REMAPPED) {
+      console.warn(
+        `[growup-server] legacy pocketbase config remapped: url(${PB_URL_RAW} -> ${PB_URL}), chats(${PB_CHAT_COLLECTION_RAW} -> ${PB_CHAT_COLLECTION}), memories(${PB_MEMORIES_COLLECTION_RAW} -> ${PB_MEMORIES_COLLECTION})`,
+      );
+    }
     console.log(
       `[growup-server] deepseek=${DEEPSEEK_API_KEY ? 'configured' : 'missing'} text=${DEEPSEEK_TEXT_MODEL} vision=${DEEPSEEK_VISION_MODEL}`,
     );
-    console.log(`[growup-server] pocketbase=${PB_URL ? PB_URL : 'missing'} users=${PB_USERS_COLLECTION} chats=${PB_CHAT_COLLECTION}`);
+    console.log(
+      `[growup-server] pocketbase=${PB_URL ? PB_URL : 'missing'} users=${PB_USERS_COLLECTION} chats=${PB_CHAT_COLLECTION} memories=${PB_MEMORIES_COLLECTION} userApps=${PB_USER_APPS_COLLECTION} appId=${PB_APP_ID}`,
+    );
     console.log(
       `[growup-server] vector=${isVectorConfigured() ? 'enabled' : 'disabled'} qdrant=${QDRANT_URL ? 'configured' : 'missing'} collection=${QDRANT_COLLECTION} dim=${VECTOR_DIM} topK=${VECTOR_TOP_K}`,
     );
