@@ -1,66 +1,84 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState, memo } from 'react';
 import {
   ActivityIndicator,
+  Alert,
+  Animated,
+  AppState as RNAppState,
+  BackHandler,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
   Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
+  StatusBar as RNStatusBar,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import { LinearGradient } from 'expo-linear-gradient';
 import { BlurView } from 'expo-blur';
+import { LinearGradient } from 'expo-linear-gradient';
 import * as Haptics from 'expo-haptics';
 import * as ImagePicker from 'expo-image-picker';
-import { Ionicons } from '@expo/vector-icons';
+import * as Clipboard from 'expo-clipboard';
+import { lightColors, darkColors, Colors } from './src/theme';
+import { PlayfairDisplay_700Bold, useFonts as useTitleFonts } from '@expo-google-fonts/playfair-display';
 import {
-  PlayfairDisplay_700Bold,
-  useFonts as useTitleFonts,
-} from '@expo-google-fonts/playfair-display';
-import {
-  SpaceGrotesk_400Regular,
-  SpaceGrotesk_500Medium,
-  SpaceGrotesk_700Bold,
+  NotoSansSC_400Regular,
+  NotoSansSC_500Medium,
+  NotoSansSC_700Bold,
   useFonts as useBodyFonts,
-} from '@expo-google-fonts/space-grotesk';
-import { buildJournalRecordedReply, generateCoachReply } from './src/lib/assistant';
+} from '@expo-google-fonts/noto-sans-sc';
+import {
+  DMSans_400Regular,
+  DMSans_500Medium,
+  DMSans_700Bold,
+  useFonts as useDMSansFonts,
+} from '@expo-google-fonts/dm-sans';
 import {
   authLogin,
   authMe,
   authRegister,
   AuthUser,
-  fetchIdentity,
+  clearHistoryMessages,
+  deleteHistoryMessages,
   fetchHistory,
-  getApiBaseUrl,
+  fetchIdentity,
+  fetchRemoteState,
   requestAssistantReply,
   saveIdentityRemote,
+  saveRemoteState,
 } from './src/lib/api';
 import { formatClock, toDateKey, toWeekLabel } from './src/lib/date';
-import {
-  categoryLabel,
-  extractFacts,
-  findRelevantFacts,
-  mergeFacts,
-  upsertWeeklyDigest,
-} from './src/lib/memoryEngine';
+import { categoryLabel, extractFacts, findRelevantFacts, mergeFacts } from './src/lib/memoryEngine';
 import { buildPeriodicRecaps, buildRolloverPrompt } from './src/lib/recapEngine';
 import { IdentityProfile, loadIdentity, saveIdentity } from './src/lib/identity';
 import { clearSession, loadSession, saveSession } from './src/lib/session';
-import { loadAppState, saveAppState } from './src/lib/storage';
-import { AppState, ChatMessage, DailyJournal, MemoryFact, RecapPeriod, TaskItem } from './src/types';
+import { AppState, ChatMessage, PeriodicRecap, RecapPeriod } from './src/types';
+import RobotIcon, { RobotIconName } from './src/components/RobotIcon';
 
-type TabKey = 'chat' | 'journal' | 'memory' | 'recap';
+type TabKey = 'home' | 'chat' | 'recap' | 'me';
 type AuthMode = 'login' | 'register';
+type FontStyle = { fontFamily?: string };
+type QuoteRole = 'user' | 'assistant';
 
-interface PickedImage {
-  uri: string;
-  mimeType: string;
-  dataUrl: string;
+interface QuoteDraft {
+  messageId: string;
+  role: QuoteRole;
+  text: string;
+}
+
+interface ParsedQuotedMessage {
+  body: string;
+  quote: {
+    role: QuoteRole;
+    text: string;
+  } | null;
 }
 
 interface AuthSession {
@@ -68,16 +86,60 @@ interface AuthSession {
   user: AuthUser;
 }
 
-const moodOptions = [
-  { score: 1, label: '浣庤惤' },
-  { score: 2, label: '一般' },
-  { score: 3, label: '绋冲畾' },
-  { score: 4, label: '绉瀬' },
-  { score: 5, label: '浜㈠' },
-];
+type GrowthStateSlices = Pick<AppState, 'facts' | 'journals' | 'tasks' | 'digests' | 'recaps' | 'lastRolloverDate'>;
+
+const ACCENT = '#FF6B35';
 
 function createId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function sanitizeQuoteSnippet(text: string, maxLen = 80): string {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .replace(/」/g, '”')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function parseQuotedMessageText(text: string): ParsedQuotedMessage {
+  const raw = String(text || '');
+  const match = /^回复「(AI|我)：([^\n]{1,220})」\n?([\s\S]*)$/u.exec(raw);
+  if (!match) {
+    return { body: raw, quote: null };
+  }
+  const role: QuoteRole = match[1] === 'AI' ? 'assistant' : 'user';
+  const quoteText = sanitizeQuoteSnippet(match[2], 220);
+  const body = String(match[3] || '').trimStart();
+  return {
+    body,
+    quote: quoteText ? { role, text: quoteText } : null,
+  };
+}
+
+function buildQuotedMessageText(body: string, draft: QuoteDraft | null): string {
+  const normalizedBody = String(body || '').trim();
+  if (!normalizedBody) return '';
+  if (!draft) return normalizedBody;
+  const roleLabel = draft.role === 'assistant' ? 'AI' : '我';
+  const snippet = sanitizeQuoteSnippet(draft.text, 120);
+  if (!snippet) return normalizedBody;
+  return `回复「${roleLabel}：${snippet}」\n${normalizedBody}`;
+}
+
+function textForModelFromMessageText(text: string): string {
+  const parsed = parseQuotedMessageText(text);
+  if (!parsed.quote) return (text || '').trim();
+  const roleLabel = parsed.quote.role === 'assistant' ? 'AI' : '我';
+  const body = parsed.body.trim();
+  return [`引用${roleLabel}：${parsed.quote.text}`, body].filter(Boolean).join('\n');
+}
+
+function displayTextFromMessageText(text: string): string {
+  const parsed = parseQuotedMessageText(text);
+  if (parsed.body.trim()) return parsed.body.trim();
+  if (parsed.quote?.text) return parsed.quote.text;
+  return String(text || '').trim();
 }
 
 function defaultState(): AppState {
@@ -86,7 +148,7 @@ function defaultState(): AppState {
       {
         id: createId('msg'),
         role: 'assistant',
-        text: '欢迎来到 GrowUp。登录后我会帮你长期保存聊天和图片记录。',
+        text: '嗨，我在这儿。想聊什么就说，我都会认真听。',
         createdAt: new Date().toISOString(),
       },
     ],
@@ -99,328 +161,322 @@ function defaultState(): AppState {
   };
 }
 
-function makeDraft(dateKey: string): DailyJournal {
+function normalizeGrowthStateSlices(input: Partial<GrowthStateSlices> | null | undefined): GrowthStateSlices {
+  const journals = Array.isArray(input?.journals) ? input.journals : [];
   return {
-    id: createId('journal'),
-    dateKey,
-    mood: 3,
-    wins: '',
-    lessons: '',
-    focus: '',
-    gratitude: '',
+    facts: Array.isArray(input?.facts) ? input.facts : [],
+    journals,
+    tasks: Array.isArray(input?.tasks) ? input.tasks : [],
+    digests: Array.isArray(input?.digests) ? input.digests : [],
+    recaps: Array.isArray(input?.recaps) && input.recaps.length > 0 ? input.recaps : buildPeriodicRecaps(journals),
+    lastRolloverDate:
+      typeof input?.lastRolloverDate === 'string' && input.lastRolloverDate.trim()
+        ? input.lastRolloverDate.trim()
+        : toDateKey(),
   };
 }
 
-function upsertJournal(journals: DailyJournal[], item: DailyJournal): DailyJournal[] {
-  const index = journals.findIndex((journal) => journal.dateKey === item.dateKey);
-  if (index < 0) return [...journals, item].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
-  const next = [...journals];
-  next[index] = { ...item, id: journals[index].id };
-  return next;
+function periodLabel(period: RecapPeriod, date: Date): string {
+  if (period === 'day') return toDateKey(date);
+  if (period === 'week') return toWeekLabel(date);
+  if (period === 'month') return `${date.getFullYear()}-${`${date.getMonth() + 1}`.padStart(2, '0')}`;
+  return `${date.getFullYear()}`;
 }
 
-function summary(journal: DailyJournal): string {
-  return [journal.focus, journal.wins, journal.lessons, journal.gratitude].filter(Boolean).join('；').slice(0, 240);
+function periodRange(period: RecapPeriod, date: Date): { startDate: string; endDate: string } {
+  if (period === 'day') {
+    const key = toDateKey(date);
+    return { startDate: key, endDate: key };
+  }
+
+  if (period === 'week') {
+    const day = new Date(date);
+    const weekday = day.getDay();
+    const shift = weekday === 0 ? 6 : weekday - 1;
+    day.setDate(day.getDate() - shift);
+    const startDate = toDateKey(day);
+    const end = new Date(day);
+    end.setDate(end.getDate() + 6);
+    return { startDate, endDate: toDateKey(end) };
+  }
+
+  if (period === 'month') {
+    const start = new Date(date.getFullYear(), date.getMonth(), 1);
+    const end = new Date(date.getFullYear(), date.getMonth() + 1, 0);
+    return { startDate: toDateKey(start), endDate: toDateKey(end) };
+  }
+
+  const start = new Date(date.getFullYear(), 0, 1);
+  const end = new Date(date.getFullYear(), 11, 31);
+  return { startDate: toDateKey(start), endDate: toDateKey(end) };
 }
 
-function factColor(fact: MemoryFact): string {
-  if (fact.category === 'goal') return '#1D4ED8';
-  if (fact.category === 'habit') return '#15803D';
-  if (fact.category === 'identity') return '#C2410C';
-  if (fact.category === 'relationship') return '#BE185D';
-  if (fact.category === 'preference') return '#6D28D9';
-  return '#B91C1C';
+function messagesInPeriod(messages: ChatMessage[], period: RecapPeriod, now: Date): ChatMessage[] {
+  const label = periodLabel(period, now);
+  return messages.filter((item) => {
+    const date = new Date(item.createdAt);
+    if (Number.isNaN(date.getTime())) return false;
+    if (period === 'day') return toDateKey(date) === label;
+    if (period === 'week') return toWeekLabel(date) === label;
+    if (period === 'month') return `${date.getFullYear()}-${`${date.getMonth() + 1}`.padStart(2, '0')}` === label;
+    return `${date.getFullYear()}` === label;
+  });
 }
 
-interface TaskBoardStats {
-  yesterdayDone: number;
-  weekDone: number;
-  monthDone: number;
-  yearDone: number;
+function extractJsonObject(text: string): Record<string, unknown> | null {
+  const cleaned = text.trim();
+  const fenced = /```json\s*([\s\S]*?)```/i.exec(cleaned);
+  const candidate = fenced ? fenced[1] : cleaned;
+  const first = candidate.indexOf('{');
+  const last = candidate.lastIndexOf('}');
+  if (first < 0 || last <= first) return null;
+  try {
+    return JSON.parse(candidate.slice(first, last + 1)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
-function parseDateKey(dateKey: string): Date {
-  return new Date(`${dateKey}T00:00:00`);
+function isInternalRecapPrompt(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return normalized.startsWith('请根据以下聊天记录生成')
+    && normalized.includes('仅返回 JSON')
+    && normalized.includes('"summary"')
+    && normalized.includes('"important"')
+    && normalized.includes('"todo"');
 }
 
-function toMonthKey(dateKey: string): string {
-  return dateKey.slice(0, 7);
+function isInternalRecapJsonReply(text: string): boolean {
+  const parsed = extractJsonObject(text);
+  if (!parsed) return false;
+  return typeof parsed.summary === 'string'
+    && Array.isArray(parsed.important)
+    && Array.isArray(parsed.todo);
 }
 
-function toYearKey(dateKey: string): string {
-  return dateKey.slice(0, 4);
+function stripInternalRecapMessages(messages: ChatMessage[]): ChatMessage[] {
+  const cleaned: ChatMessage[] = [];
+  let waitingRecapReply = false;
+
+  for (const message of messages) {
+    if (message.role === 'user' && isInternalRecapPrompt(message.text)) {
+      waitingRecapReply = true;
+      continue;
+    }
+
+    if (waitingRecapReply && message.role === 'assistant' && isInternalRecapJsonReply(message.text)) {
+      waitingRecapReply = false;
+      continue;
+    }
+
+    waitingRecapReply = false;
+    cleaned.push(message);
+  }
+
+  return cleaned;
 }
 
-function previousDateKey(dateKey: string): string {
-  const date = parseDateKey(dateKey);
-  date.setDate(date.getDate() - 1);
-  return toDateKey(date);
-}
-
-function buildTaskBoardStats(tasks: TaskItem[], todayDateKey: string): TaskBoardStats {
-  const yesterdayKey = previousDateKey(todayDateKey);
-  const weekLabel = toWeekLabel(parseDateKey(todayDateKey));
-  const monthKey = toMonthKey(todayDateKey);
-  const yearKey = toYearKey(todayDateKey);
-  const done = tasks.filter((item) => item.done);
+function fallbackRecapDraft(logs: ChatMessage[]): {
+  summary: string;
+  important: string[];
+  todo: string[];
+  milestones: string[];
+  growths: string[];
+} {
+  const userLogs = logs.filter((item) => item.role === 'user');
+  const summary =
+    userLogs.length > 0
+      ? `最近你主要在做：${userLogs
+          .slice(-3)
+          .map((item) => item.text.replace(/\s+/g, ' ').trim())
+          .filter(Boolean)
+          .join('；')
+          .slice(0, 120)}`
+      : '当前记录较少，建议先明确最重要的一件事。';
+  const important = userLogs
+    .slice(-5)
+    .map((item) => item.text.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .slice(0, 3);
   return {
-    yesterdayDone: done.filter((item) => item.dateKey === yesterdayKey).length,
-    weekDone: done.filter((item) => toWeekLabel(parseDateKey(item.dateKey)) === weekLabel).length,
-    monthDone: done.filter((item) => toMonthKey(item.dateKey) === monthKey).length,
-    yearDone: done.filter((item) => toYearKey(item.dateKey) === yearKey).length,
+    summary,
+    important,
+    todo: ['把下一步拆成今天可执行的动作', '做完后继续复盘反馈'],
+    milestones: ['保持持续记录'],
+    growths: ['表达更具体，目标更清晰'],
   };
 }
 
-function buildTaskInsight(tasks: TaskItem[], stats: TaskBoardStats): { solved: string; next: string; cheer: string } {
-  const done = tasks.filter((item) => item.done).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  const pending = tasks.filter((item) => !item.done).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  const solved =
-    done.length > 0
-      ? `最近完成：${done.slice(0, 3).map((item) => `「${item.title}」`).join('、')}。`
-      : '最近还没有已完成任务，先完成一个最小任务建立节奏。';
-  const next = pending.length > 0 ? `下一步建议：优先推进「${pending[0].title}」。` : '下一步建议：创建一个可在今天完成的具体任务。';
-  const cheer =
-    stats.weekDone >= 7
-      ? '这周执行力很强，保持这个节奏。'
-      : stats.weekDone >= 3
-      ? '这周推进稳定，再加一到两个关键任务会更好。'
-      : '先把本周最重要的一件事做完，完成感会明显提升。';
-  return { solved, next, cheer };
+function upsertRecap(recaps: PeriodicRecap[], incoming: PeriodicRecap): PeriodicRecap[] {
+  const index = recaps.findIndex((item) => item.period === incoming.period && item.label === incoming.label);
+  const next = [...recaps];
+  if (index >= 0) next[index] = incoming;
+  else next.push(incoming);
+  return next
+    .sort((a, b) => new Date(b.endDate).getTime() - new Date(a.endDate).getTime())
+    .slice(0, 240);
+}
+
+function relevantDayRecapMemories(recaps: PeriodicRecap[], query: string, limit = 2): string[] {
+  const normalized = (query || '').trim().toLowerCase();
+  const tokens = normalized.split(/[\s,，。！？；、]+/g).filter((item) => item.length >= 2);
+
+  const scored = recaps
+    .filter((item) => item.period === 'day')
+    .map((item) => {
+      const text = [item.summary, ...item.highlights, ...item.actions].join(' ').toLowerCase();
+      let score = 0;
+      for (const token of tokens) {
+        if (text.includes(token)) score += 1;
+      }
+      return { item, score };
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return new Date(b.item.endDate).getTime() - new Date(a.item.endDate).getTime();
+    })
+    .slice(0, Math.max(1, limit));
+
+  const memories: string[] = [];
+  for (const entry of scored) {
+    const recap = entry.item;
+    memories.push(`日复盘(${recap.label})：${(recap.summary || '').slice(0, 120)}`);
+    if (recap.highlights && recap.highlights.length > 0) {
+      memories.push(`日亮点(${recap.label})：${(recap.highlights[0] || '').slice(0, 80)}`);
+    }
+    if (recap.actions && recap.actions.length > 0) {
+      memories.push(`日行动(${recap.label})：${(recap.actions[0] || '').slice(0, 80)}`);
+    }
+  }
+
+  return memories.slice(0, 6);
+}
+
+function buildClipboardFromMessages(messages: ChatMessage[]): string {
+  if (!messages || messages.length === 0) return '';
+  return messages
+    .map((msg) => {
+      const speaker = msg.role === 'user' ? '我' : 'AI';
+      const parsed = parseQuotedMessageText(msg.text || '');
+      const mainText = (parsed.body || '').trim();
+      const quoteText = parsed.quote ? `（引用${parsed.quote.role === 'assistant' ? 'AI' : '我'}：${parsed.quote.text}）` : '';
+      const text = [quoteText, mainText].filter(Boolean).join(' ');
+      const imageTag = msg.imageUri ? ' [图片]' : '';
+      const content = text || (msg.imageUri ? '（图片）' : '');
+      return `${speaker} ${formatClock(msg.createdAt)}: ${content}${imageTag}`;
+    })
+    .join('\n');
+}
+
+function sortMessagesChronologically(messages: ChatMessage[]): ChatMessage[] {
+  return [...(messages || [])].sort((a, b) => {
+    const aTime = Date.parse(String(a?.createdAt || ''));
+    const bTime = Date.parse(String(b?.createdAt || ''));
+    const aValid = Number.isFinite(aTime);
+    const bValid = Number.isFinite(bTime);
+
+    if (aValid && bValid && aTime !== bTime) return aTime - bTime;
+
+    const byCreated = String(a?.createdAt || '').localeCompare(String(b?.createdAt || ''));
+    if (byCreated !== 0) return byCreated;
+    return String(a?.id || '').localeCompare(String(b?.id || ''));
+  });
 }
 
 export default function App() {
-  const [titleLoaded] = useTitleFonts({ PlayfairDisplay_700Bold });
-  const [bodyLoaded] = useBodyFonts({
-    SpaceGrotesk_400Regular,
-    SpaceGrotesk_500Medium,
-    SpaceGrotesk_700Bold,
+  const [titleLoaded, titleFontError] = useTitleFonts({ PlayfairDisplay_700Bold });
+  const [bodyLoaded, bodyFontError] = useBodyFonts({
+    NotoSansSC_400Regular,
+    NotoSansSC_500Medium,
+    NotoSansSC_700Bold,
   });
+  const [dmLoaded, dmFontError] = useDMSansFonts({
+    DMSans_400Regular,
+    DMSans_500Medium,
+    DMSans_700Bold,
+  });
+  const fontsReady = (titleLoaded || Boolean(titleFontError)) && (bodyLoaded || Boolean(bodyFontError)) && (dmLoaded || Boolean(dmFontError));
 
-  const [tab, setTab] = useState<TabKey>('chat');
+  const [tab, setTab] = useState<TabKey>('home');
   const [state, setState] = useState<AppState>(defaultState);
   const [hydrated, setHydrated] = useState(false);
+  const [bootTimedOut, setBootTimedOut] = useState(false);
+  const [networkStateLoaded, setNetworkStateLoaded] = useState(false);
+
   const [input, setInput] = useState('');
-  const [selectedImage, setSelectedImage] = useState<PickedImage | null>(null);
+  const [inputFocused, setInputFocused] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
+  const [chatSelectionMode, setChatSelectionMode] = useState(false);
+  const [selectedMessageIds, setSelectedMessageIds] = useState<string[]>([]);
+  const [chatActionBusy, setChatActionBusy] = useState(false);
+  const [quoteDraft, setQuoteDraft] = useState<QuoteDraft | null>(null);
+
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [authMode, setAuthMode] = useState<AuthMode>('login');
-  const [authName, setAuthName] = useState('');
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState('');
+
   const [identity, setIdentity] = useState<IdentityProfile | null>(null);
   const [identityUserName, setIdentityUserName] = useState('');
   const [identityCompanionName, setIdentityCompanionName] = useState('贾维斯');
-  const [identityBusy, setIdentityBusy] = useState(false);
+  const [identityCompanionGender, setIdentityCompanionGender] = useState('中性');
+  const [identityCompanionMbti, setIdentityCompanionMbti] = useState('');
+  const [identityCompanionProfession, setIdentityCompanionProfession] = useState('');
   const [identityUserBio, setIdentityUserBio] = useState('');
+  const [identityBusy, setIdentityBusy] = useState(false);
+  const [forceIdentitySetup, setForceIdentitySetup] = useState(false);
+  const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
+  const [identitySetupReturnTab, setIdentitySetupReturnTab] = useState<TabKey>('home');
+
+  // 主题状态
+  const [themeMode, setThemeMode] = useState<'light' | 'dark'>('light');
+  const isDark = themeMode === 'dark';
+
+  // 动态主题颜色 - 使用完整的主题系统
+  const colors = useMemo(() => isDark ? darkColors : lightColors, [isDark]);
+
+  const toggleTheme = () => setThemeMode(prev => prev === 'light' ? 'dark' : 'light');
+
   const [recapPeriod, setRecapPeriod] = useState<RecapPeriod>('day');
-  const [taskEditorOpen, setTaskEditorOpen] = useState(false);
-  const [taskTitle, setTaskTitle] = useState('');
-  const [taskImage, setTaskImage] = useState<PickedImage | null>(null);
-  const [taskAnalyzing, setTaskAnalyzing] = useState(false);
-  const [taskSaving, setTaskSaving] = useState(false);
-  const [taskAiSummary, setTaskAiSummary] = useState('');
-  const [taskAiBusy, setTaskAiBusy] = useState(false);
-  const taskAiSignatureRef = useRef('');
+  const recapBootRef = useRef<{ signature: string; lastRunAt: number }>({
+    signature: '',
+    lastRunAt: 0,
+  });
+  const chatScrollRef = useRef<ScrollView | null>(null);
+  const composerInputRef = useRef<TextInput | null>(null);
+  const shouldAutoScrollRef = useRef(true);
+  const hasChatLaidOutRef = useRef(false);
+
   const todayKey = toDateKey();
-  const todayJournal = useMemo(
-    () => state.journals.find((item) => item.dateKey === todayKey) ?? null,
-    [state.journals, todayKey],
-  );
-  const [draft, setDraft] = useState<DailyJournal>(makeDraft(todayKey));
+  const bodyFont: FontStyle = fontsReady ? { fontFamily: 'NotoSansSC_500Medium' } : {};
+  const bodyMedium: FontStyle = fontsReady ? { fontFamily: 'NotoSansSC_700Bold' } : {};
+  const bodyBold: FontStyle = fontsReady ? { fontFamily: 'NotoSansSC_700Bold' } : {};
+  const titleFont: FontStyle = fontsReady ? { fontFamily: 'PlayfairDisplay_700Bold' } : {};
+  const chatBottomPadding = isKeyboardVisible
+    ? (quoteDraft ? 188 : 142)
+    : (quoteDraft ? 132 : 90);
+  const selectedMessageIdSet = useMemo(() => new Set(selectedMessageIds), [selectedMessageIds]);
 
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      const [savedAppState, savedSession] = await Promise.all([loadAppState(), loadSession()]);
-      if (!alive) return;
-
-      if (savedAppState) {
-        const normalized: AppState = {
-          ...defaultState(),
-          ...savedAppState,
-          recaps:
-            Array.isArray(savedAppState.recaps) && savedAppState.recaps.length > 0
-              ? savedAppState.recaps
-              : buildPeriodicRecaps(savedAppState.journals || []),
-          lastRolloverDate:
-            typeof savedAppState.lastRolloverDate === 'string' && savedAppState.lastRolloverDate
-              ? savedAppState.lastRolloverDate
-              : toDateKey(),
-        };
-        setState(normalized);
-      }
-
-      if (savedSession) {
-        try {
-          const refreshed = await authMe(savedSession.token);
-          if (!alive) return;
-          const nextSession: AuthSession = { token: refreshed.token, user: refreshed.user };
-          setAuthSession(nextSession);
-          await saveSession(nextSession);
-          await loadOrInitIdentity(nextSession.user, nextSession.token);
-          if (!alive) return;
-          const messages = await fetchHistory(nextSession.token, 180);
-          if (!alive) return;
-          if (messages.length > 0) {
-            setState((prev) => ({ ...prev, messages }));
-          }
-        } catch {
-          await clearSession();
-          if (alive) {
-            setIdentity(null);
-          }
-        }
-      }
-
-      setHydrated(true);
-    })();
-
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    saveAppState(state).catch(() => undefined);
-  }, [state, hydrated]);
-
-  useEffect(() => {
-    if (todayJournal) setDraft(todayJournal);
-    else setDraft(makeDraft(todayKey));
-  }, [todayJournal, todayKey]);
-
-  useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(''), 2600);
+    const timer = setTimeout(() => {
+      setBootTimedOut(true);
+      setHydrated((prev) => (prev ? prev : true));
+    }, 12000);
     return () => clearTimeout(timer);
-  }, [notice]);
-
-  useEffect(() => {
-    if (!hydrated || !identity?.ready) return;
-    setState((prev) => {
-      if (prev.lastRolloverDate === todayKey) return prev;
-      const rolloverMessage: ChatMessage = {
-        id: createId('rollover'),
-        role: 'assistant',
-        text: buildRolloverPrompt(identity.companionName, prev.recaps),
-        createdAt: new Date().toISOString(),
-      };
-      return {
-        ...prev,
-        lastRolloverDate: todayKey,
-        messages: [...prev.messages, rolloverMessage].slice(-240),
-      };
-    });
-  }, [hydrated, identity?.ready, identity?.companionName, todayKey]);
-
-  const metrics = useMemo(
-    () => ({
-      facts: state.facts.length,
-      journals: state.journals.length,
-      recaps: state.recaps.length,
-      focus: todayJournal?.focus || '鍏堝畾涔変粖澶╂渶閲嶈鐨勪竴浠朵簨',
-    }),
-    [state.facts.length, state.journals.length, state.recaps.length, todayJournal],
-  );
-
-  const visibleRecaps = useMemo(
-    () => state.recaps.filter((item) => item.period === recapPeriod).slice(0, 24),
-    [state.recaps, recapPeriod],
-  );
-  const todayTasks = useMemo(
-    () => state.tasks.filter((item) => item.dateKey === todayKey).sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
-    [state.tasks, todayKey],
-  );
-  const taskBoardStats = useMemo(() => buildTaskBoardStats(state.tasks, todayKey), [state.tasks, todayKey]);
-  const taskInsight = useMemo(() => buildTaskInsight(state.tasks, taskBoardStats), [state.tasks, taskBoardStats]);
-
-  useEffect(() => {
-    if (!authSession || !identity?.ready) return;
-
-    const doneTitles = state.tasks.filter((item) => item.done).map((item) => item.title);
-    const pendingTitles = state.tasks.filter((item) => !item.done).map((item) => item.title);
-    const signature = `${todayKey}|${doneTitles.join('|')}|${pendingTitles.join('|')}`;
-    if (taskAiSignatureRef.current === signature) return;
-    taskAiSignatureRef.current = signature;
-
-    if (doneTitles.length === 0 && pendingTitles.length === 0) {
-      setTaskAiSummary('先创建今天的第一个任务，我会根据你的完成情况给你复盘建议。');
-      return;
-    }
-
-    let cancelled = false;
-    (async () => {
-      setTaskAiBusy(true);
-      try {
-        const result = await requestAssistantReply(
-          {
-            message: [
-              '请你基于我的任务清单做一次简短复盘（3 行内）：',
-              `昨天完成：${taskBoardStats.yesterdayDone}`,
-              `本周完成：${taskBoardStats.weekDone}`,
-              `本月完成：${taskBoardStats.monthDone}`,
-              `今年完成：${taskBoardStats.yearDone}`,
-              `最近完成任务：${doneTitles.slice(-8).join('；') || '暂无'}`,
-              `未完成任务：${pendingTitles.slice(0, 6).join('；') || '暂无'}`,
-              '请输出：1) 最近解决了什么问题 2) 当前节奏评价 3) 下一步最优先动作',
-            ].join('\n'),
-            relevantMemories: [],
-            todayJournal,
-            identity: {
-              userName: identity.userName,
-              companionName: identity.companionName,
-              userBio: identity.userBio,
-            },
-          },
-          authSession.token,
-        );
-        if (!cancelled) {
-          setTaskAiSummary(result.reply.trim());
-        }
-      } catch {
-        if (!cancelled) {
-          setTaskAiSummary(`${taskInsight.solved}\n${taskInsight.next}`);
-        }
-      } finally {
-        if (!cancelled) {
-          setTaskAiBusy(false);
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    authSession,
-    identity,
-    state.tasks,
-    taskBoardStats.yesterdayDone,
-    taskBoardStats.weekDone,
-    taskBoardStats.monthDone,
-    taskBoardStats.yearDone,
-    taskInsight.solved,
-    taskInsight.next,
-    todayJournal,
-    todayKey,
-  ]);
-
-  const bodyFont = { fontFamily: 'SpaceGrotesk_400Regular' as const };
-  const bodyMedium = { fontFamily: 'SpaceGrotesk_500Medium' as const };
-  const bodyBold = { fontFamily: 'SpaceGrotesk_700Bold' as const };
-  const titleFont = { fontFamily: 'PlayfairDisplay_700Bold' as const };
+  }, []);
 
   const inferUserName = (user: AuthUser): string => {
     if (user.name && user.name.trim()) return user.name.trim();
     if (user.email.includes('@')) return user.email.split('@')[0];
-    return '鏈嬪弸';
+    return '朋友';
   };
 
   const loadOrInitIdentity = async (user: AuthUser, token?: string): Promise<IdentityProfile> => {
+    const local = await loadIdentity(user.id);
+
     if (token) {
       try {
         const remote = await fetchIdentity(token);
@@ -429,110 +485,446 @@ export default function App() {
             userId: user.id,
             userName: remote.userName,
             companionName: remote.companionName,
+            companionGender: remote.companionGender || '中性',
+            companionMbti: remote.companionMbti || '',
+            companionProfession: remote.companionProfession || '',
             userBio: remote.userBio || '',
+            userAvatarUrl: local?.userAvatarUrl,
             ready: true,
           };
           setIdentity(synced);
           setIdentityUserName(synced.userName);
           setIdentityCompanionName(synced.companionName);
+          setIdentityCompanionGender(synced.companionGender || '中性');
+          setIdentityCompanionMbti(synced.companionMbti || '');
+          setIdentityCompanionProfession(synced.companionProfession || '');
           setIdentityUserBio(synced.userBio);
+          setForceIdentitySetup(!synced.ready);
           await saveIdentity(synced);
           return synced;
         }
       } catch {
-        // ignore remote errors and fallback to local identity
+        // ignore
       }
     }
 
-    const loaded = await loadIdentity(user.id);
-    if (loaded) {
-      setIdentity(loaded);
-      setIdentityUserName(loaded.userName || inferUserName(user));
-      setIdentityCompanionName(loaded.companionName || '贾维斯');
-      setIdentityUserBio(loaded.userBio || '');
-      return loaded;
+    if (local) {
+      setIdentity(local);
+      setIdentityUserName(local.userName || inferUserName(user));
+      setIdentityCompanionName(local.companionName || '贾维斯');
+      setIdentityCompanionGender(local.companionGender || '中性');
+      setIdentityCompanionMbti(local.companionMbti || '');
+      setIdentityCompanionProfession(local.companionProfession || '');
+      setIdentityUserBio(local.userBio || '');
+      setForceIdentitySetup(!local.ready);
+      return local;
     }
+
     const created: IdentityProfile = {
       userId: user.id,
       userName: inferUserName(user),
       companionName: '贾维斯',
+      companionGender: '中性',
+      companionMbti: '',
+      companionProfession: '',
       userBio: '',
       ready: false,
     };
     setIdentity(created);
     setIdentityUserName(created.userName);
     setIdentityCompanionName(created.companionName);
+    setIdentityCompanionGender(created.companionGender);
+    setIdentityCompanionMbti(created.companionMbti);
+    setIdentityCompanionProfession(created.companionProfession);
     setIdentityUserBio(created.userBio);
+    setForceIdentitySetup(true);
     await saveIdentity(created);
     return created;
   };
 
-  const loadCloudHistory = async (token: string) => {
-    const messages = await fetchHistory(token, 180);
-    if (messages.length === 0) return;
-    setState((prev) => ({
-      ...prev,
-      messages,
-    }));
+  const loadCloudData = async (token: string): Promise<{ issues: string[] }> => {
+    const [messagesResult, remoteStateResult] = await Promise.allSettled([
+      fetchHistory(token, 180),
+      fetchRemoteState(token),
+    ]);
+
+    const issues: string[] = [];
+    const messages = messagesResult.status === 'fulfilled' ? messagesResult.value : null;
+    const remoteState = remoteStateResult.status === 'fulfilled' ? remoteStateResult.value : null;
+
+    if (messagesResult.status === 'rejected') {
+      issues.push(messagesResult.reason instanceof Error ? messagesResult.reason.message : '读取聊天记录失败');
+    }
+    if (remoteStateResult.status === 'rejected') {
+      issues.push(remoteStateResult.reason instanceof Error ? remoteStateResult.reason.message : '读取成长数据失败');
+    }
+
+    setState((prev) => {
+      let next = prev;
+      if (remoteState) {
+        const slices = normalizeGrowthStateSlices(remoteState);
+        next = { ...next, ...slices };
+      }
+      if (messages && messages.length > 0) {
+        const cleanedMessages = sortMessagesChronologically(stripInternalRecapMessages(messages));
+        if (cleanedMessages.length > 0) {
+          next = { ...next, messages: cleanedMessages };
+        }
+      }
+      return next;
+    });
+
+    return { issues };
   };
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      const session = await loadSession();
+      if (!active) return;
+
+      if (!session) {
+        setHydrated(true);
+        return;
+      }
+
+      try {
+        const refreshed = await authMe(session.token);
+        if (!active) return;
+
+        const nextSession: AuthSession = { token: refreshed.token, user: refreshed.user };
+        setAuthSession(nextSession);
+        await saveSession(nextSession);
+
+        const identityProfile = await loadOrInitIdentity(nextSession.user, nextSession.token);
+        if (!active) return;
+
+        const cloudResult = await loadCloudData(nextSession.token);
+        if (!active) return;
+
+        setForceIdentitySetup(!identityProfile.ready);
+        setNetworkStateLoaded(true);
+        if (cloudResult.issues.length > 0) {
+          setNotice('已进入应用，云端数据将稍后继续同步');
+        }
+      } catch {
+        await clearSession();
+        if (!active) return;
+        setAuthSession(null);
+        setIdentity(null);
+        setForceIdentitySetup(false);
+      } finally {
+        if (active) setHydrated(true);
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(''), 2600);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
+    const onShow = () => {
+      setIsKeyboardVisible(true);
+      requestAnimationFrame(() => {
+        chatScrollRef.current?.scrollToEnd({ animated: true });
+      });
+      setTimeout(() => {
+        chatScrollRef.current?.scrollToEnd({ animated: true });
+      }, 80);
+    };
+
+    const onHide = () => {
+      setIsKeyboardVisible(false);
+      setInputFocused(false);
+    };
+
+    const showSub = Keyboard.addListener('keyboardDidShow', onShow);
+    const hideSub = Keyboard.addListener('keyboardDidHide', onHide);
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (forceIdentitySetup) {
+        if (!identity?.ready) return true;
+        setForceIdentitySetup(false);
+        setTab(identitySetupReturnTab);
+        return true;
+      }
+      if (tab !== 'home') {
+        setTab('home');
+        return true;
+      }
+      return false;
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [forceIdentitySetup, identity?.ready, identitySetupReturnTab, tab]);
+
+  useEffect(() => {
+    if (!hydrated || !identity?.ready) return;
+    setState((prev) => {
+      if (prev.lastRolloverDate === todayKey) return prev;
+      const assistant: ChatMessage = {
+        id: createId('rollover'),
+        role: 'assistant',
+        text: buildRolloverPrompt(identity.companionName, prev.recaps),
+        createdAt: new Date().toISOString(),
+      };
+      return {
+        ...prev,
+        lastRolloverDate: todayKey,
+        messages: [...prev.messages, assistant].slice(-240),
+      };
+    });
+  }, [hydrated, identity?.ready, identity?.companionName, todayKey]);
+
+  // 每小时自动复盘 - 仅前台运行
+  const lastRecapHourRef = useRef<number>(-1);
+  
+  useEffect(() => {
+    if (!hydrated || !identity?.ready || !authSession) return;
+
+    const appStateSub = RNAppState.addEventListener('change', (nextAppState) => {
+      // 进入前台时重置定时器检查
+      if (nextAppState === 'active') {
+        lastRecapHourRef.current = -1;
+      }
+    });
+
+    const interval = setInterval(() => {
+      // 只在前台运行
+      if (RNAppState.currentState !== 'active') return;
+      
+      const now = new Date();
+      const currentHour = now.getHours();
+      
+      // 每小时只执行一次
+      if (currentHour === lastRecapHourRef.current) return;
+      lastRecapHourRef.current = currentHour;
+
+      // 生成当日复盘（静默更新）
+      setState((prev) => {
+        const todayMessages = messagesInPeriod(prev.messages, 'day', now);
+        if (todayMessages.length < 3) return prev; // 消息太少不生成
+
+        const todayKey = toDateKey(now);
+        const todayRecap: PeriodicRecap = {
+          id: `auto-recap-${todayKey}-${currentHour}`,
+          period: 'day',
+          label: todayKey,
+          startDate: todayKey,
+          endDate: todayKey,
+          summary: `今日${todayMessages.length}条对话，持续记录中...`,
+          highlights: ['自动记录中'],
+          lowlights: [],
+          actions: [],
+          milestones: [],
+          growths: [],
+          createdAt: new Date().toISOString(),
+        };
+
+        // 覆盖当天的复盘
+        const otherRecaps = prev.recaps.filter(r => !(r.period === 'day' && r.label === todayKey));
+        
+        return {
+          ...prev,
+          recaps: [...otherRecaps, todayRecap],
+        };
+      });
+    }, 60 * 60 * 1000); // 每小时检查一次
+
+    return () => {
+      appStateSub.remove();
+      clearInterval(interval);
+    };
+  }, [hydrated, identity?.ready, authSession]);
+
+  const remoteGrowthState = useMemo<GrowthStateSlices>(
+    () => ({
+      facts: state.facts,
+      journals: state.journals,
+      tasks: state.tasks,
+      digests: state.digests,
+      recaps: state.recaps,
+      lastRolloverDate: state.lastRolloverDate,
+    }),
+    [state.facts, state.journals, state.tasks, state.digests, state.recaps, state.lastRolloverDate],
+  );
+
+  useEffect(() => {
+    if (!hydrated || !authSession || !networkStateLoaded) return;
+    const timer = setTimeout(() => {
+      saveRemoteState(authSession.token, remoteGrowthState).catch(() => undefined);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [hydrated, authSession, networkStateLoaded, remoteGrowthState]);
+
+  useEffect(() => {
+    if (!hydrated || !authSession || !identity?.ready || !networkStateLoaded) return;
+    const snapshot = state.messages.slice(-240);
+    const userMessages = snapshot.filter((item) => item.role === 'user');
+    if (userMessages.length === 0) return;
+
+    const lastUserMessage = userMessages[userMessages.length - 1];
+    const signaturePrefix = `${authSession.user.id}|${todayKey}|`;
+    const runSignature = `${signaturePrefix}${lastUserMessage.id}`;
+    const nowMs = Date.now();
+
+    if (recapBootRef.current.signature === runSignature) return;
+    if (
+      recapBootRef.current.signature.startsWith(signaturePrefix)
+      && nowMs - recapBootRef.current.lastRunAt < 60000
+    ) {
+      return;
+    }
+    recapBootRef.current = { signature: runSignature, lastRunAt: nowMs };
+
+    const periods: RecapPeriod[] = ['day', 'week', 'month', 'year'];
+    const now = new Date();
+    let cancelled = false;
+
+    (async () => {
+      for (const period of periods) {
+        if (cancelled) return;
+        const logs = messagesInPeriod(snapshot, period, now).slice(-48);
+        if (logs.filter((x) => x.role === 'user').length === 0) continue;
+
+        const fallback = fallbackRecapDraft(logs);
+        let summary = fallback.summary;
+        let important = fallback.important;
+        let todo = fallback.todo;
+        let milestones = fallback.milestones;
+        let growths = fallback.growths;
+
+        const label = periodLabel(period, now);
+        const range = periodRange(period, now);
+        const recap: PeriodicRecap = {
+          id: createId(`recap-${period}`),
+          period,
+          label,
+          startDate: range.startDate,
+          endDate: range.endDate,
+          summary,
+          highlights: important,
+          lowlights: [],
+          actions: todo,
+          milestones,
+          growths,
+          createdAt: new Date().toISOString(),
+        };
+
+        if (!cancelled) {
+          setState((prev) => ({ ...prev, recaps: upsertRecap(prev.recaps, recap) }));
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hydrated, authSession, identity, networkStateLoaded, todayKey, state.messages]);
+
+  const visibleRecaps = useMemo(
+    () => state.recaps.filter((item) => item.period === recapPeriod).slice(0, 24),
+    [state.recaps, recapPeriod],
+  );
 
   const submitAuth = async () => {
     const email = authEmail.trim();
     const password = authPassword;
-    const name = authName.trim();
 
     if (!email || !password) {
-      setAuthError('璇疯緭鍏ラ偖绠卞拰瀵嗙爜');
+      setAuthError('请输入邮箱和密码');
       return;
     }
-    if (authMode === 'register' && password.length < 6) {
-      setAuthError('密码至少 6 位');
+    if (authMode === 'register' && password.length < 8) {
+      setAuthError('密码至少 8 位');
       return;
     }
 
     await Haptics.selectionAsync();
     setAuthBusy(true);
     setAuthError('');
+    setNetworkStateLoaded(false);
 
     try {
-      const result =
-        authMode === 'register'
-          ? await authRegister({ email, password, name })
-          : await authLogin({ email, password });
+      const result = authMode === 'register' ? await authRegister({ email, password }) : await authLogin({ email, password });
       const session: AuthSession = { token: result.token, user: result.user };
       setAuthSession(session);
       await saveSession(session);
-      await loadOrInitIdentity(session.user, session.token);
-      await loadCloudHistory(session.token);
-      setNotice('鐧诲綍鎴愬姛锛屼簯绔褰曞凡杩炴帴');
+      const identityProfile = await loadOrInitIdentity(session.user, session.token);
+      const cloudResult = await loadCloudData(session.token);
+      setForceIdentitySetup(!identityProfile.ready);
+      setNetworkStateLoaded(true);
+      if (cloudResult.issues.length > 0) {
+        setNotice('登录成功，云端数据正在同步');
+      } else {
+        setNotice('登录成功，云端数据已连接');
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : '鐧诲綍澶辫触';
-      setAuthError(message);
+      setAuthError(error instanceof Error ? error.message : '登录失败');
     } finally {
       setAuthBusy(false);
     }
   };
-
   const logout = async () => {
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     await clearSession();
     setAuthSession(null);
-    setAuthPassword('');
+    setAuthMode('login');
     setAuthEmail('');
+    setAuthPassword('');
+    setAuthError('');
     setIdentity(null);
     setIdentityUserName('');
     setIdentityCompanionName('贾维斯');
+    setIdentityCompanionGender('中性');
+    setIdentityCompanionMbti('');
+    setIdentityCompanionProfession('');
     setIdentityUserBio('');
-    setState(defaultState());
+    setForceIdentitySetup(false);
+    setIdentitySetupReturnTab('home');
+    setIsKeyboardVisible(false);
+    setTab('home');
+    setInput('');
+    setBusy(false);
     setNotice('已退出登录');
+    setState(defaultState());
+    setNetworkStateLoaded(false);
+    recapBootRef.current = { signature: '', lastRunAt: 0 };
   };
 
   const submitIdentity = async () => {
-    if (!authSession) return;
+    if (!authSession) {
+      setNotice('登录状态失效，请重新登录');
+      return;
+    }
+    if (!identity) {
+      setNotice('资料还在加载，请稍后再试');
+      return;
+    }
+    if (identityBusy) return;
+
     const userName = identityUserName.trim() || inferUserName(authSession.user);
     const companionName = identityCompanionName.trim() || '贾维斯';
+    const companionGender = identityCompanionGender.trim() || '中性';
+    const companionMbti = '';
+    const companionProfession = '';
     const userBio = identityUserBio.trim();
-    if (!identity) return;
+    const editingExistingIdentity = identity.ready;
 
     setIdentityBusy(true);
     try {
@@ -540,322 +932,576 @@ export default function App() {
         ...identity,
         userName,
         companionName,
+        companionGender,
+        companionMbti,
+        companionProfession,
         userBio,
         ready: true,
       };
       setIdentity(next);
       setIdentityUserName(next.userName);
       setIdentityCompanionName(next.companionName);
+      setIdentityCompanionGender(next.companionGender || '中性');
+      setIdentityCompanionMbti('');
+      setIdentityCompanionProfession('');
       setIdentityUserBio(next.userBio);
       await saveIdentity(next);
-      if (authSession?.token) {
-        await saveIdentityRemote(authSession.token, {
-          userName: next.userName,
-          companionName: next.companionName,
-          userBio: next.userBio,
-        });
+
+      await saveIdentityRemote(authSession.token, {
+        userName: next.userName,
+        companionName: next.companionName,
+        companionGender: next.companionGender,
+        companionMbti: next.companionMbti,
+        companionProfession: next.companionProfession,
+        userBio: next.userBio,
+      });
+
+      if (editingExistingIdentity) {
+        const nowIso = new Date().toISOString();
+        const updateFacts = extractFacts(
+          `我叫${userName}。我的伙伴叫${companionName}，性别${companionGender}。${userBio}`,
+          nowIso,
+        );
+        const roleChangedTip: ChatMessage = {
+          id: createId('identity-updated'),
+          role: 'assistant',
+          text: `角色已更新：从现在开始我会以「${companionName}」这个设定和你聊天，新的名字和性别都已经生效。`,
+          createdAt: new Date(Date.now() + 1).toISOString(),
+        };
+        setState((prev) => ({
+          ...prev,
+          facts: mergeFacts(prev.facts, updateFacts),
+          messages: [...prev.messages, roleChangedTip].slice(-240),
+        }));
+      } else {
+        const nowIso = new Date().toISOString();
+        const ask: ChatMessage = {
+          id: createId('identity-ask'),
+          role: 'assistant',
+          text: `你好，我是${companionName}。希望我怎么称呼你？也可以介绍一下你自己。`,
+          createdAt: nowIso,
+        };
+        const intro: ChatMessage = {
+          id: createId('identity-user'),
+          role: 'user',
+          text: userBio ? `你可以叫我${userName}。我的自我介绍：${userBio}` : `你可以叫我${userName}。`,
+          createdAt: nowIso,
+        };
+        const ack: ChatMessage = {
+          id: createId('identity-ack'),
+          role: 'assistant',
+          text: `记住了，${userName}。以后你随时找我，我们在一边。`,
+          createdAt: nowIso,
+        };
+
+        const introFacts = extractFacts(
+          `我叫${userName}。我的伙伴叫${companionName}，性别${companionGender}。${userBio}`,
+          nowIso,
+        );
+        setState((prev) => ({
+          ...prev,
+          facts: mergeFacts(prev.facts, introFacts),
+          messages: [...prev.messages, ask, intro, ack].slice(-240),
+        }));
       }
-
-      const nowIso = new Date().toISOString();
-      const assistantAsk: ChatMessage = {
-        id: createId('identity-ask'),
-        role: 'assistant',
-        text: `你好，我是${companionName}。我想先了解你：希望我怎么称呼你？也可以介绍一下你自己。`,
-        createdAt: nowIso,
-      };
-      const userIntroText = userBio
-        ? `你可以叫我${userName}。我的自我介绍：${userBio}`
-        : `你可以叫我${userName}。`;
-      const userIntroMessage: ChatMessage = {
-        id: createId('identity-user'),
-        role: 'user',
-        text: userIntroText,
-        createdAt: nowIso,
-      };
-      const assistantAck: ChatMessage = {
-        id: createId('identity-ack'),
-        role: 'assistant',
-        text: `记住了，${userName}。从今天开始我会像生活搭子一样陪你，每天一起复盘并推进重点。`,
-        createdAt: nowIso,
-      };
-      const introFacts = extractFacts(`我叫${userName}。我的AI伙伴叫${companionName}。${userBio}`, nowIso);
-
-      setState((prev) => ({
-        ...prev,
-        facts: mergeFacts(prev.facts, introFacts),
-        messages: [...prev.messages, assistantAsk, userIntroMessage, assistantAck].slice(-240),
-      }));
-      setNotice(`设定完成：${companionName} 已上线`);
+      setForceIdentitySetup(false);
+      setTab(identitySetupReturnTab);
+      setNotice(editingExistingIdentity ? '资料已更新' : `设定完成：${companionName} 已上线`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '保存失败，请稍后重试');
     } finally {
       setIdentityBusy(false);
     }
   };
 
-  const pickImage = async () => {
+  const focusComposer = () => {
+    if (chatSelectionMode) {
+      setNotice('请先退出多选模式再输入');
+      return;
+    }
+    shouldAutoScrollRef.current = true;
+    requestAnimationFrame(() => {
+      chatScrollRef.current?.scrollToEnd({ animated: true });
+      setTimeout(() => composerInputRef.current?.focus(), 10);
+    });
+  };
+
+  const pickUserAvatar = async () => {
+    if (!identity) return;
     await Haptics.selectionAsync();
+
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      setNotice('请允许相册权限。');
+      setNotice('请允许相册权限后再设置头像');
       return;
     }
+
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: true,
+      aspect: [1, 1],
       quality: 0.72,
-      base64: true,
     });
-    if (result.canceled) return;
-    const asset = result.assets[0];
-    if (!asset.base64) {
-      setNotice('图片读取失败，请重试。');
-      return;
-    }
-    const mimeType = asset.mimeType || 'image/jpeg';
-    setSelectedImage({
-      uri: asset.uri,
-      mimeType,
-      dataUrl: `data:${mimeType};base64,${asset.base64}`,
-    });
-  };
-
-  const analyzeTaskFromImage = async (image: PickedImage) => {
-    if (!authSession) return;
-    setTaskAnalyzing(true);
-    try {
-      const result = await requestAssistantReply(
-        {
-          message: '请基于这张图片生成一个今天可执行的任务名，20字以内，只返回任务名称。',
-          imageDataUrl: image.dataUrl,
-          relevantMemories: [],
-          todayJournal,
-          identity: identity
-            ? {
-                userName: identity.userName,
-                companionName: identity.companionName,
-                userBio: identity.userBio,
-              }
-            : undefined,
-        },
-        authSession.token,
-      );
-      const parsed = result.reply.replace(/[\r\n]+/g, ' ').replace(/[。！!]/g, '').trim();
-      if (parsed) {
-        setTaskTitle(parsed.slice(0, 28));
-      } else {
-        setNotice('图片分析结果为空，请手动填写任务名');
-      }
-    } catch {
-      setNotice('图片分析失败，请手动填写任务名');
-    } finally {
-      setTaskAnalyzing(false);
-    }
-  };
-
-  const pickTaskImage = async (source: 'library' | 'camera') => {
-    await Haptics.selectionAsync();
-    if (source === 'library') {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
-        setNotice('请允许相册权限。');
-        return;
-      }
-    } else {
-      const permission = await ImagePicker.requestCameraPermissionsAsync();
-      if (!permission.granted) {
-        setNotice('请允许相机权限。');
-        return;
-      }
-    }
-
-    const result =
-      source === 'library'
-        ? await ImagePicker.launchImageLibraryAsync({
-            mediaTypes: ImagePicker.MediaTypeOptions.Images,
-            quality: 0.72,
-            base64: true,
-          })
-        : await ImagePicker.launchCameraAsync({
-            quality: 0.72,
-            base64: true,
-          });
 
     if (result.canceled) return;
     const asset = result.assets[0];
-    if (!asset.base64) {
-      setNotice('图片读取失败，请重试。');
+    if (!asset?.uri) {
+      setNotice('头像读取失败，请重试');
       return;
     }
 
-    const mimeType = asset.mimeType || 'image/jpeg';
-    const picked: PickedImage = {
-      uri: asset.uri,
-      mimeType,
-      dataUrl: `data:${mimeType};base64,${asset.base64}`,
+    const nextIdentity: IdentityProfile = {
+      ...identity,
+      userAvatarUrl: asset.uri,
     };
-    setTaskImage(picked);
-    await analyzeTaskFromImage(picked);
+    setIdentity(nextIdentity);
+    await saveIdentity(nextIdentity);
+    setNotice('头像已更新');
   };
 
-  const saveTask = async () => {
-    const title = taskTitle.trim();
-    if (!title) {
-      setNotice('请填写任务名称');
+  const exitChatSelectionMode = () => {
+    setChatSelectionMode(false);
+    setSelectedMessageIds([]);
+  };
+
+  const toggleSelectMessage = (messageId: string) => {
+    setSelectedMessageIds((prev) => {
+      if (prev.includes(messageId)) {
+        const next = prev.filter((id) => id !== messageId);
+        if (next.length === 0) {
+          setChatSelectionMode(false);
+        }
+        return next;
+      }
+      return [...prev, messageId];
+    });
+  };
+
+  const dismissComposerKeyboard = () => {
+    if (!isKeyboardVisible && !inputFocused) return;
+    Keyboard.dismiss();
+    setInputFocused(false);
+  };
+
+  const startQuoteReply = (messageId: string) => {
+    const target = state.messages.find((item) => item.id === messageId);
+    if (!target) return;
+    if (target.text === '正在输入...') {
+      setNotice('这条消息还在生成中，暂时不能引用');
+      return;
+    }
+    const displayText = displayTextFromMessageText(target.text);
+    const snippet = sanitizeQuoteSnippet(displayText, 120);
+    if (!snippet) {
+      setNotice('这条消息暂时不能引用');
       return;
     }
 
-    setTaskSaving(true);
+    setQuoteDraft({
+      messageId: target.id,
+      role: target.role === 'assistant' ? 'assistant' : 'user',
+      text: snippet,
+    });
+    setChatSelectionMode(false);
+    setSelectedMessageIds([]);
+    setNotice(`已引用${target.role === 'assistant' ? 'AI' : '我'}的消息`);
+    requestAnimationFrame(() => {
+      composerInputRef.current?.focus();
+    });
+  };
+
+  const enterSelectionModeWithMessage = async (messageId: string) => {
+    await Haptics.selectionAsync();
+    setChatSelectionMode(true);
+    setQuoteDraft(null);
+    setInputFocused(false);
+    Keyboard.dismiss();
+    setSelectedMessageIds((prev) => (prev.includes(messageId) ? prev : [...prev, messageId]));
+  };
+
+  const onMessageLongPress = async (messageId: string) => {
+    if (chatSelectionMode) {
+      toggleSelectMessage(messageId);
+      return;
+    }
+
+    Alert.alert(
+      '消息操作',
+      '选择你要执行的操作',
+      [
+        {
+          text: '引用回复',
+          onPress: () => startQuoteReply(messageId),
+        },
+        {
+          text: '多选',
+          onPress: () => {
+            void enterSelectionModeWithMessage(messageId);
+          },
+        },
+        { text: '取消', style: 'cancel' },
+      ],
+      { cancelable: true },
+    );
+  };
+
+  const onMessagePress = (messageId: string) => {
+    if (!chatSelectionMode) {
+      dismissComposerKeyboard();
+      return;
+    }
+    toggleSelectMessage(messageId);
+  };
+
+  const copySelectedMessages = async () => {
+    if (selectedMessageIds.length === 0) {
+      setNotice('请先选中消息');
+      return;
+    }
+    const selectedMessages = state.messages.filter((item) => selectedMessageIdSet.has(item.id));
+    const text = buildClipboardFromMessages(selectedMessages);
+    if (!text.trim()) {
+      setNotice('选中的消息没有可复制内容');
+      return;
+    }
+
+    await Clipboard.setStringAsync(text);
+    setNotice(`已复制 ${selectedMessages.length} 条消息`);
+    exitChatSelectionMode();
+  };
+
+  const copyAllMessages = async () => {
+    if (chatSelectionMode) {
+      setNotice('请先退出多选模式');
+      return;
+    }
+
+    const exportMessages = state.messages.filter((item) => {
+      const text = (item.text || '').trim();
+      if (!text && !item.imageUri) return false;
+      if (text === '正在输入...') return false;
+      if (isInternalRecapPrompt(text) || isInternalRecapJsonReply(text)) return false;
+      return true;
+    });
+
+    const text = buildClipboardFromMessages(exportMessages);
+    if (!text.trim()) {
+      setNotice('当前没有可复制的聊天记录');
+      return;
+    }
+
+    await Haptics.selectionAsync();
+    await Clipboard.setStringAsync(text);
+    setNotice(`已复制全部聊天记录（${exportMessages.length} 条）`);
+  };
+
+  const performClearAllMessages = async () => {
+    if (chatActionBusy) return;
+    setChatActionBusy(true);
     try {
-      const nextTask: TaskItem = {
-        id: createId('task'),
-        dateKey: todayKey,
-        title,
-        done: false,
-        fromImage: Boolean(taskImage),
+      let cloudFailed = false;
+      let cloudDeleted = 0;
+      if (authSession) {
+        try {
+          const result = await clearHistoryMessages(authSession.token);
+          cloudDeleted = Number(result.deleted || 0);
+        } catch {
+          cloudFailed = true;
+        }
+      }
+
+      const starter: ChatMessage = {
+        id: createId('msg'),
+        role: 'assistant',
+        text: `嗨，我是${identity?.companionName || '伙伴'}。我们重新开始聊吧。`,
         createdAt: new Date().toISOString(),
       };
+
       setState((prev) => ({
         ...prev,
-        tasks: [...prev.tasks, nextTask].slice(-240),
+        messages: [starter],
+        facts: [],
       }));
-      setTaskTitle('');
-      setTaskImage(null);
-      setTaskEditorOpen(false);
-      setNotice('任务已保存');
+      setQuoteDraft(null);
+      exitChatSelectionMode();
+      setNotice(
+        cloudFailed
+          ? '已清空本地聊天记录（云端稍后再同步）'
+          : `已清空聊天记录${cloudDeleted > 0 ? `（云端删除 ${cloudDeleted} 条）` : ''}`,
+      );
     } finally {
-      setTaskSaving(false);
+      setChatActionBusy(false);
     }
   };
 
-  const toggleTaskDone = (taskId: string) => {
-    setState((prev) => ({
-      ...prev,
-      tasks: prev.tasks.map((item) => (item.id === taskId ? { ...item, done: !item.done } : item)),
-    }));
+  const clearAllMessages = () => {
+    if (chatSelectionMode) {
+      setNotice('请先退出多选模式');
+      return;
+    }
+    Alert.alert(
+      '清空聊天记录',
+      '会删除当前账号的全部聊天记录，并清理聊天记忆。这个操作不能撤销。',
+      [
+        { text: '取消', style: 'cancel' },
+        {
+          text: '确认清空',
+          style: 'destructive',
+          onPress: () => {
+            void performClearAllMessages();
+          },
+        },
+      ],
+    );
+  };
+
+  const deleteSelectedMessages = async () => {
+    if (selectedMessageIds.length === 0) {
+      setNotice('请先选中消息');
+      return;
+    }
+    if (chatActionBusy) return;
+
+    setChatActionBusy(true);
+    try {
+      let cloudDeleteFailed = false;
+      if (authSession) {
+        try {
+          const result = await deleteHistoryMessages(authSession.token, selectedMessageIds);
+          if (result.notOwned > 0) {
+            setNotice('有部分消息不属于当前账号，已跳过');
+          }
+        } catch {
+          cloudDeleteFailed = true;
+        }
+      }
+
+      setState((prev) => ({
+        ...prev,
+        messages: prev.messages.filter((item) => !selectedMessageIdSet.has(item.id)).slice(-240),
+      }));
+      if (quoteDraft && selectedMessageIdSet.has(quoteDraft.messageId)) {
+        setQuoteDraft(null);
+      }
+      setNotice(
+        cloudDeleteFailed
+          ? `已删除本地 ${selectedMessageIds.length} 条消息（云端稍后再同步）`
+          : `已删除 ${selectedMessageIds.length} 条消息`,
+      );
+      exitChatSelectionMode();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '删除失败，请稍后重试');
+    } finally {
+      setChatActionBusy(false);
+    }
   };
 
   const onSend = async () => {
+    if (chatSelectionMode) {
+      setNotice('请先退出多选模式');
+      return;
+    }
     if (!authSession) {
       setNotice('请先登录后发送');
       return;
     }
     if (!identity || !identity.ready) {
-      setNotice('先完成伙伴命名后再开始聊天');
+      setNotice('请先完成伙伴设定');
       return;
     }
 
     const text = input.trim();
-    if ((!text && !selectedImage) || busy) return;
+    if (!text || busy) return;
+    const activeQuoteDraft = quoteDraft;
+    const composedUserText = buildQuotedMessageText(text, activeQuoteDraft);
+    if (!composedUserText) return;
 
     await Haptics.selectionAsync();
     setBusy(true);
     setInput('');
+    setQuoteDraft(null);
 
     const nowIso = new Date().toISOString();
-    const userText = text || '请帮我分析这张图片，并给出成长建议。';
+    const userText = composedUserText;
+    const recentMessages = state.messages
+      .filter((item) => item.text && item.text.trim())
+      .filter((item) => !isInternalRecapPrompt(item.text))
+      .filter((item) => !isInternalRecapJsonReply(item.text))
+      .filter((item) => item.text !== '正在输入...')
+      .slice(-12);
     const extracted = extractFacts(text, nowIso);
-    const nextFacts = mergeFacts(state.facts, extracted);
-    const relevant = findRelevantFacts(nextFacts, text || '鍥剧墖鍒嗘瀽', 5);
+    const mergedFacts = mergeFacts(state.facts, extracted);
+    const relevantFacts = findRelevantFacts(mergedFacts, text, 5);
+    const relevantRecaps = relevantDayRecapMemories(state.recaps, text, 2);
+    const relevantMemories = [
+      ...relevantFacts.map((item) => `${categoryLabel(item.category)}：${item.value}`),
+      ...relevantRecaps,
+    ].slice(0, 10);
+    const modelRecentMessages = recentMessages.map((item) => ({
+      role: item.role,
+      text: textForModelFromMessageText(item.text),
+    }));
 
     const userMessage: ChatMessage = {
       id: createId('local-user'),
       role: 'user',
-      text: text || '[鍥剧墖]',
-      imageUri: selectedImage?.uri,
-      imageMimeType: selectedImage?.mimeType,
+      text: composedUserText,
+      createdAt: nowIso,
+    };
+    const thinkingId = createId('assistant-thinking');
+    const thinkingMessage: ChatMessage = {
+      id: thinkingId,
+      role: 'assistant',
+      text: '正在输入...',
       createdAt: nowIso,
     };
 
     setState((prev) => ({
       ...prev,
       facts: mergeFacts(prev.facts, extracted),
-      messages: [...prev.messages, userMessage].slice(-240),
+      messages: [...prev.messages, userMessage, thinkingMessage].slice(-240),
     }));
 
     try {
       const result = await requestAssistantReply(
         {
-          message: userText,
-          imageDataUrl: selectedImage?.dataUrl,
-          relevantMemories: relevant.map((item) => `${categoryLabel(item.category)}: ${item.value}`),
-          todayJournal,
+          message: textForModelFromMessageText(userText),
+          recentMessages: modelRecentMessages,
+          relevantMemories,
+          todayJournal: null,
           identity: {
             userName: identity.userName,
             companionName: identity.companionName,
+            companionGender: identity.companionGender,
+            companionMbti: '',
+            companionProfession: '',
             userBio: identity.userBio,
           },
         },
         authSession.token,
       );
 
-      const assistantMessage: ChatMessage = {
-        id: createId('local-assistant'),
-        role: 'assistant',
-        text: result.reply,
-        createdAt: new Date().toISOString(),
-      };
-
-      setState((prev) => ({
-        ...prev,
-        facts: nextFacts,
-        messages: [...prev.messages, assistantMessage].slice(-240),
-      }));
+      setState((prev) => {
+        const assistant: ChatMessage = {
+          id: thinkingId,
+          role: 'assistant',
+          text: result.reply,
+          createdAt: new Date().toISOString(),
+        };
+        let replaced = false;
+        const patched = prev.messages.map((item) => {
+          if (item.id !== thinkingId) return item;
+          replaced = true;
+          return assistant;
+        });
+        const nextMessages = replaced ? patched : [...patched, assistant];
+        return {
+          ...prev,
+          facts: mergedFacts,
+          messages: nextMessages.slice(-240),
+        };
+      });
     } catch (error) {
-      const fallback = generateCoachReply(userText, relevant, todayJournal, identity || undefined);
-      const assistantMessage: ChatMessage = {
-        id: createId('fallback-assistant'),
-        role: 'assistant',
-        text: `${fallback}\n\n(鍚庣璋冪敤澶辫触锛屽凡鍥為€€鏈湴妯″紡)`,
-        createdAt: new Date().toISOString(),
-      };
-      setState((prev) => ({
-        ...prev,
-        facts: nextFacts,
-        messages: [...prev.messages, assistantMessage].slice(-240),
-      }));
-      setNotice(error instanceof Error ? error.message : '璇锋眰澶辫触');
+      const message = error instanceof Error ? error.message : '网络失败，请稍后重试';
+      setState((prev) => {
+        const errorTip: ChatMessage = {
+          id: thinkingId,
+          role: 'assistant',
+          text: `网络失败：${message}`,
+          createdAt: new Date().toISOString(),
+        };
+        let replaced = false;
+        const patched = prev.messages.map((item) => {
+          if (item.id !== thinkingId) return item;
+          replaced = true;
+          return errorTip;
+        });
+        const nextMessages = replaced ? patched : [...patched, errorTip];
+        return {
+          ...prev,
+          messages: nextMessages.slice(-240),
+        };
+      });
+      setNotice(message);
     } finally {
-      setSelectedImage(null);
       setBusy(false);
     }
   };
 
-  const onSaveJournal = async () => {
-    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    const clean: DailyJournal = {
-      ...draft,
-      wins: draft.wins.trim(),
-      lessons: draft.lessons.trim(),
-      focus: draft.focus.trim(),
-      gratitude: draft.gratitude.trim(),
-    };
-    const nowIso = new Date().toISOString();
-    const extracted = extractFacts(`${clean.focus}。${clean.wins}。${clean.lessons}。${clean.gratitude}`, nowIso);
-    setState((prev) => {
-      const journals = upsertJournal(prev.journals, clean);
-      const digests = upsertWeeklyDigest(prev.digests, clean, nowIso);
-      const facts = mergeFacts(prev.facts, extracted);
-      const recaps = buildPeriodicRecaps(journals, nowIso);
-      const assistantMessage: ChatMessage = {
-        id: createId('journal-assistant'),
-        role: 'assistant',
-        text: buildJournalRecordedReply(summary(clean) || '日志已记录。'),
-        createdAt: nowIso,
-      };
-      return {
-        ...prev,
-        journals,
-        digests,
-        recaps,
-        facts,
-        messages: [...prev.messages, assistantMessage].slice(-240),
-      };
-    });
-    setTab('chat');
+  const onChatScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+    const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+    shouldAutoScrollRef.current = distanceFromBottom <= 96;
   };
 
-  if (!titleLoaded || !bodyLoaded || !hydrated) {
+  const onChatContentSizeChange = () => {
+    if (!shouldAutoScrollRef.current) return;
+    requestAnimationFrame(() => {
+      chatScrollRef.current?.scrollToEnd({ animated: hasChatLaidOutRef.current });
+    });
+  };
+
+  const onChatLayout = () => {
+    if (hasChatLaidOutRef.current) return;
+    hasChatLaidOutRef.current = true;
+    requestAnimationFrame(() => {
+      chatScrollRef.current?.scrollToEnd({ animated: false });
+    });
+  };
+
+  useEffect(() => {
+    if (tab !== 'chat' || !isKeyboardVisible) return;
+    requestAnimationFrame(() => {
+      chatScrollRef.current?.scrollToEnd({ animated: true });
+    });
+  }, [isKeyboardVisible, tab]);
+
+  useEffect(() => {
+    if (tab !== 'chat') return;
+    if (chatSelectionMode) return;
+    const timer = setTimeout(() => {
+      focusComposer();
+    }, 80);
+    return () => clearTimeout(timer);
+  }, [tab, chatSelectionMode]);
+
+  useEffect(() => {
+    if (tab === 'chat') return;
+    if (!chatSelectionMode && selectedMessageIds.length === 0) return;
+    setChatSelectionMode(false);
+    setSelectedMessageIds([]);
+  }, [tab, chatSelectionMode, selectedMessageIds.length]);
+
+  const openIdentitySetup = (returnTab: TabKey = tab) => {
+    if (!authSession || !identity) return;
+    setIdentityBusy(false);
+    setIdentitySetupReturnTab(returnTab);
+    setIdentityUserName(identity.userName || inferUserName(authSession.user));
+    setIdentityCompanionName(identity.companionName || '贾维斯');
+    setIdentityCompanionGender(identity.companionGender || '中性');
+    setIdentityCompanionMbti(identity.companionMbti || '');
+    setIdentityCompanionProfession(identity.companionProfession || '');
+    setIdentityUserBio(identity.userBio || '');
+    setForceIdentitySetup(true);
+  };
+
+  const cancelIdentitySetup = () => {
+    if (!identity?.ready) return;
+    setIdentityBusy(false);
+    setIdentityUserName(identity.userName || '朋友');
+    setIdentityCompanionName(identity.companionName || '贾维斯');
+    setIdentityCompanionGender(identity.companionGender || '中性');
+    setIdentityCompanionMbti(identity.companionMbti || '');
+    setIdentityCompanionProfession(identity.companionProfession || '');
+    setIdentityUserBio(identity.userBio || '');
+    setForceIdentitySetup(false);
+    setTab(identitySetupReturnTab);
+  };
+
+  if ((!fontsReady || !hydrated) && !bootTimedOut) {
     return (
       <View style={styles.loading}>
-        <ActivityIndicator size="large" color="#0F172A" />
+        <ActivityIndicator size="large" color={ACCENT} />
       </View>
     );
   }
@@ -865,8 +1511,6 @@ export default function App() {
       <AuthScreen
         mode={authMode}
         setMode={setAuthMode}
-        name={authName}
-        setName={setAuthName}
         email={authEmail}
         setEmail={setAuthEmail}
         password={authPassword}
@@ -874,7 +1518,6 @@ export default function App() {
         busy={authBusy}
         error={authError}
         onSubmit={submitAuth}
-        titleFont={titleFont}
         bodyFont={bodyFont}
         bodyMedium={bodyMedium}
         bodyBold={bodyBold}
@@ -882,17 +1525,21 @@ export default function App() {
     );
   }
 
-  if (!identity || !identity.ready) {
+  if (!identity || !identity.ready || forceIdentitySetup) {
     return (
       <IdentitySetupScreen
         userName={identityUserName}
         setUserName={setIdentityUserName}
         companionName={identityCompanionName}
         setCompanionName={setIdentityCompanionName}
+        companionGender={identityCompanionGender}
+        setCompanionGender={setIdentityCompanionGender}
         userBio={identityUserBio}
         setUserBio={setIdentityUserBio}
         busy={identityBusy}
         onSubmit={submitIdentity}
+        allowCancel={Boolean(identity?.ready)}
+        onCancel={cancelIdentitySetup}
         titleFont={titleFont}
         bodyFont={bodyFont}
         bodyMedium={bodyMedium}
@@ -900,299 +1547,300 @@ export default function App() {
       />
     );
   }
-
   return (
-    <LinearGradient colors={['#FCEEDA', '#ECF7F1', '#EAF1FF']} style={styles.root}>
-      <StatusBar style="dark" />
-      <SafeAreaView style={styles.safe}>
-        <View style={styles.header}>
-          <View>
-            <Text style={[styles.brand, titleFont]}>GrowUp</Text>
-            <Text style={[styles.sub, bodyMedium]}>
-              {identity?.ready ? `${identity.companionName} 陪跑中 · 云端同步已连接` : 'AI 记忆陪跑 · 云端同步已连接'}
-            </Text>
-          </View>
-          <View style={styles.userWrap}>
-            <Text style={[styles.userName, bodyMedium]} numberOfLines={1}>
-              {authSession.user.name || authSession.user.email}
-            </Text>
-            <Pressable style={styles.logoutBtn} onPress={logout}>
-              <Ionicons name="log-out-outline" size={16} color="#7F1D1D" />
-            </Pressable>
-          </View>
-          <View style={styles.metricRow}>
-            <Metric label="记忆" value={`${metrics.facts}`} font={bodyMedium} />
-            <Metric label="日志" value={`${metrics.journals}`} font={bodyMedium} />
-            <Metric label="复盘" value={`${metrics.recaps}`} font={bodyMedium} />
-          </View>
-        </View>
+    <View style={[styles.root, { backgroundColor: colors.background }]}>
+      <StatusBar style={isDark ? "light" : "dark"} />
+      <SafeAreaView
+        style={[
+          styles.safe,
+          {
+            paddingTop: Platform.OS === 'android' ? (RNStatusBar.currentHeight || 0) + 6 : 6,
+            paddingBottom: isKeyboardVisible ? 0 : 10,
+          },
+        ]}
+      >
+        <View style={styles.flex}>
+          {tab === 'home' ? (
+            <View style={styles.homeScreen}>
+              <View style={[styles.homeTopNav, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+                <Pressable style={styles.homeNavItem} onPress={() => setTab('chat')}>
+                  <RobotIcon name="robot" size={16} color="#FF6B35" />
+                  <Text style={[styles.homeNavLabel, bodyMedium, { color: colors.textPrimary }]}>{identity?.companionName || '伙伴'}</Text>
+                </Pressable>
+                <Pressable style={styles.homeNavItem} onPress={() => setTab('recap')}>
+                  <RobotIcon name="recap" size={16} color="#FF6B35" />
+                  <Text style={[styles.homeNavLabel, bodyMedium, { color: colors.textPrimary }]}>复盘</Text>
+                </Pressable>
+                <Pressable style={styles.homeNavItem} onPress={() => setTab('me')}>
+                  <RobotIcon name="profile" size={16} color="#FF6B35" />
+                  <Text style={[styles.homeNavLabel, bodyMedium, { color: colors.textPrimary }]}>我的</Text>
+                </Pressable>
+              </View>
+              <View style={styles.homeCenter}>
+                <Text style={[styles.homeTitle, bodyBold, { color: colors.textPrimary }]}>欢迎回来，{identity?.userName || inferUserName(authSession.user)}</Text>
+                <Text style={[styles.homeDesc, bodyFont, { color: colors.textSecondary }]}>
+                  {`点上面的「${identity?.companionName || '伙伴'}」，直接进入聊天输入。`}
+                </Text>
+              </View>
+              {notice ? <Text style={[styles.notice, bodyFont]}>{notice}</Text> : null}
+            </View>
+          ) : null}
 
-        <View style={styles.panel}>
           {tab === 'chat' ? (
-            <KeyboardAvoidingView behavior={Platform.select({ ios: 'padding', android: undefined })} style={styles.flex}>
-              <LinearGradient colors={['#0F172A', '#1E293B']} style={styles.hero}>
-                <Text style={[styles.heroText, bodyBold]}>{metrics.focus}</Text>
-              </LinearGradient>
-
-              <ScrollView style={styles.flex} contentContainerStyle={styles.chatList}>
-                {state.messages.map((msg) => (
-                  <View key={msg.id} style={[styles.msgRow, msg.role === 'assistant' ? styles.left : styles.right]}>
-                    <View style={[styles.msgBubble, msg.role === 'assistant' ? styles.assistant : styles.user]}>
-                      {msg.imageUri ? <Image source={{ uri: msg.imageUri }} style={styles.msgImage} /> : null}
-                      <Text style={[styles.msgText, msg.role === 'assistant' ? styles.dark : styles.light, bodyFont]}>
-                        {msg.text}
-                      </Text>
-                      <Text style={[styles.msgTime, msg.role === 'assistant' ? styles.darkSoft : styles.lightSoft, bodyFont]}>
-                        {formatClock(msg.createdAt)}
-                      </Text>
+            <KeyboardAvoidingView
+              style={styles.flex}
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              keyboardVerticalOffset={Platform.OS === 'ios' ? 18 : 24}
+            >
+              <View style={styles.chatTopBar}>
+                {chatSelectionMode ? (
+                  <View style={styles.chatSelectionBar}>
+                    <Text style={[styles.chatSelectionCount, bodyBold, { color: colors.textPrimary }]}>
+                      已选 {selectedMessageIds.length} 条
+                    </Text>
+                    <View style={styles.chatSelectionActions}>
+                      <Pressable style={styles.chatSelectionBtn} onPress={copySelectedMessages} disabled={chatActionBusy}>
+                        <Text style={[styles.chatSelectionBtnText, bodyFont, { color: '#FF6B35' }]}>复制</Text>
+                      </Pressable>
+                      <Pressable style={styles.chatSelectionBtn} onPress={deleteSelectedMessages} disabled={chatActionBusy}>
+                        <Text style={[styles.chatSelectionBtnText, bodyFont, { color: '#FF6B35' }]}>删除</Text>
+                      </Pressable>
+                      <Pressable style={styles.chatSelectionBtn} onPress={exitChatSelectionMode} disabled={chatActionBusy}>
+                        <Text style={[styles.chatSelectionBtnText, bodyFont, { color: colors.textSecondary }]}>取消</Text>
+                      </Pressable>
                     </View>
                   </View>
-                ))}
-              </ScrollView>
-
-              <BlurView intensity={30} tint="light" style={styles.composer}>
-                {selectedImage ? (
-                  <View style={styles.previewBox}>
-                    <Image source={{ uri: selectedImage.uri }} style={styles.previewImg} />
-                    <Pressable style={styles.previewClose} onPress={() => setSelectedImage(null)}>
-                      <Ionicons name="close-circle" size={20} color="#E2E8F0" />
+                ) : (
+                  <View style={styles.chatTopSimple}>
+                    <Pressable style={styles.iconBlack} onPress={() => setTab('home')}>
+                      <RobotIcon name="back" size={15} color="#FF6B35" />
                     </Pressable>
+                    <Text style={[styles.chatTopTitle, bodyBold, { color: colors.textPrimary }]}>{identity?.companionName || '伙伴'}</Text>
+                    <View style={styles.chatTopRight}>
+                      <Pressable style={styles.chatTopCopyBtn} onPress={copyAllMessages}>
+                        <Text style={[styles.chatTopCopyText, bodyMedium, { color: '#FF6B35' }]}>复制全部</Text>
+                      </Pressable>
+                      <Pressable style={[styles.chatTopCopyBtn, styles.chatTopDangerBtn]} onPress={clearAllMessages} disabled={chatActionBusy}>
+                        <Text style={[styles.chatTopCopyText, bodyMedium, { color: '#DC2626' }]}>清空</Text>
+                      </Pressable>
+                    </View>
                   </View>
+                )}
+              </View>
+
+              <View style={styles.chatStage}>
+                <ScrollView
+                  ref={chatScrollRef}
+                  style={styles.flex}
+                  contentContainerStyle={[styles.chatList, { paddingBottom: chatBottomPadding }]}
+                  keyboardShouldPersistTaps="handled"
+                  keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+                  onTouchStart={() => {
+                    dismissComposerKeyboard();
+                  }}
+                  onLayout={onChatLayout}
+                  onScroll={onChatScroll}
+                  onContentSizeChange={onChatContentSizeChange}
+                  scrollEventThrottle={16}
+                >
+                  {state.messages.length <= 1 ? (
+                    <View style={styles.emptyChatState}>
+                      <LinearGradient
+                        colors={['#FFFFFF', '#FFF4EF']}
+                        start={{ x: 0, y: 0 }}
+                        end={{ x: 1, y: 1 }}
+                        style={styles.emptyChatIcon}
+                      >
+                        <RobotIcon name="robot" size={34} color="#FF6B35" />
+                      </LinearGradient>
+                      <Text style={[styles.emptyChatTitle, bodyBold, { color: colors.textPrimary }]}>和{identity?.companionName || '伙伴'}聊聊吧</Text>
+                      <Text style={[styles.emptyChatDesc, bodyFont, { color: colors.textSecondary }]}>分享你的想法、感受{'\n'}我会认真倾听并陪你成长</Text>
+                    </View>
+                  ) : null}
+                  {state.messages.map((msg, index) => (
+                    <MessageBubble
+                      key={msg.id}
+                      msg={msg}
+                      isNew={index === state.messages.length - 1}
+                      selectionMode={chatSelectionMode}
+                      selected={selectedMessageIdSet.has(msg.id)}
+                      onPress={onMessagePress}
+                      onLongPress={onMessageLongPress}
+                      colors={colors}
+                      bodyFont={bodyFont}
+                      isDark={isDark}
+                      userAvatarUrl={identity?.userAvatarUrl}
+                    />
+                  ))}
+                </ScrollView>
+
+                {!chatSelectionMode ? (
+                  <BlurView
+                    intensity={20}
+                    tint={isDark ? 'dark' : 'light'}
+                    style={[
+                      styles.composerDockClosed,
+                      isKeyboardVisible ? styles.composerDockRaised : null,
+                      {
+                        borderColor: colors.border,
+                        backgroundColor: isDark ? 'rgba(20, 20, 20, 0.94)' : 'rgba(255, 255, 255, 0.96)',
+                      },
+                    ]}
+                  >
+                    {quoteDraft ? (
+                      <View style={styles.quoteDraftBar}>
+                        <View style={styles.quoteDraftTextWrap}>
+                          <Text style={[styles.quoteDraftLabel, bodyMedium, { color: '#FF6B35' }]}>
+                            回复{quoteDraft.role === 'assistant' ? ' AI' : ' 我'}
+                          </Text>
+                          <Text
+                            numberOfLines={1}
+                            style={[styles.quoteDraftText, bodyFont, { color: colors.textSecondary }]}
+                          >
+                            {quoteDraft.text}
+                          </Text>
+                        </View>
+                        <Pressable
+                          style={styles.quoteDraftCloseBtn}
+                          onPress={() => setQuoteDraft(null)}
+                          hitSlop={8}
+                        >
+                          <Text style={[styles.quoteDraftCloseText, bodyMedium]}>取消</Text>
+                        </Pressable>
+                      </View>
+                    ) : null}
+                    <TextInput
+                      ref={composerInputRef}
+                      value={input}
+                      onChangeText={setInput}
+                      style={[
+                        styles.input,
+                        bodyFont,
+                        {
+                          color: colors.textPrimary,
+                          borderColor: inputFocused ? '#FF6B35' : colors.border,
+                          backgroundColor: isDark ? '#161616' : '#F5F5F5',
+                        },
+                      ]}
+                      placeholder="发消息…（回车发送）"
+                      placeholderTextColor={colors.textTertiary}
+                      autoFocus={tab === 'chat'}
+                      multiline={false}
+                      returnKeyType="send"
+                      blurOnSubmit={false}
+                      onSubmitEditing={onSend}
+                      onFocus={() => {
+                        setInputFocused(true);
+                        shouldAutoScrollRef.current = true;
+                        requestAnimationFrame(() => {
+                          chatScrollRef.current?.scrollToEnd({ animated: true });
+                        });
+                      }}
+                      onBlur={() => setInputFocused(false)}
+                    />
+                  </BlurView>
                 ) : null}
+              </View>
 
-                <TextInput
-                  value={input}
-                  onChangeText={setInput}
-                  style={[styles.input, bodyFont]}
-                  placeholder={selectedImage ? '鍙ˉ鍏呮弿杩板悗鍙戦€?..' : '鍙戜竴鍙ヤ粖澶╃殑鐘舵€侊紝鎴栫洿鎺ュ彂鍥?..'}
-                  placeholderTextColor="#64748B"
-                  multiline
-                />
-
-                <View style={styles.actions}>
-                  <Pressable style={styles.mediaBtn} onPress={pickImage}>
-                    <Ionicons name="images-outline" size={16} color="#0F172A" />
-                  </Pressable>
-                  <Pressable style={[styles.sendBtn, busy ? styles.sendBusy : null]} onPress={onSend}>
-                    {busy ? (
-                      <ActivityIndicator size="small" color="#F8FAFC" />
-                    ) : (
-                      <Ionicons name="paper-plane" size={17} color="#F8FAFC" />
-                    )}
-                  </Pressable>
-                </View>
-              </BlurView>
-
-              <Text style={[styles.hint, bodyFont]}>API: {getApiBaseUrl()}/api/chat</Text>
               {notice ? <Text style={[styles.notice, bodyFont]}>{notice}</Text> : null}
             </KeyboardAvoidingView>
           ) : null}
 
-          {tab === 'journal' ? (
-            <ScrollView style={styles.flex}>
-              <View style={styles.card}>
-                <Text style={[styles.title, bodyBold]}>今日日记</Text>
-                <Text style={[styles.hint, bodyFont]}>{todayKey}</Text>
-                <View style={styles.moodRow}>
-                  {moodOptions.map((item) => (
-                    <Pressable
-                      key={item.score}
-                      style={[styles.mood, draft.mood === item.score ? styles.moodActive : null]}
-                      onPress={() => setDraft((prev) => ({ ...prev, mood: item.score }))}
-                    >
-                      <Text style={[styles.moodText, draft.mood === item.score ? styles.moodTextActive : null, bodyFont]}>
-                        {item.label}
-                      </Text>
-                    </Pressable>
-                  ))}
+          {tab === 'recap' ? (
+            <View style={[styles.flex, { backgroundColor: colors.background }]}>
+              <View style={[styles.recapTopBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}>
+                <Pressable style={styles.iconBlack} onPress={() => setTab('home')}>
+                  <RobotIcon name="back" size={16} color="#FF6B35" />
+                </Pressable>
+                <Text style={[styles.recapTopTitle, bodyMedium, { color: colors.textPrimary }]}>复盘</Text>
+                <View style={styles.recapTopSpacer} />
+              </View>
+
+              <ScrollView style={styles.flex} contentContainerStyle={styles.recapContainer}>
+                <View style={[styles.recapFilters, { backgroundColor: isDark ? colors.surface : '#F5F5F5' }]}>
+                  <RecapFilterButton label="日" active={recapPeriod === 'day'} onPress={() => setRecapPeriod('day')} font={bodyMedium} isDark={isDark} colors={colors} />
+                  <RecapFilterButton label="周" active={recapPeriod === 'week'} onPress={() => setRecapPeriod('week')} font={bodyMedium} isDark={isDark} colors={colors} />
+                  <RecapFilterButton label="月" active={recapPeriod === 'month'} onPress={() => setRecapPeriod('month')} font={bodyMedium} isDark={isDark} colors={colors} />
+                  <RecapFilterButton label="年" active={recapPeriod === 'year'} onPress={() => setRecapPeriod('year')} font={bodyMedium} isDark={isDark} colors={colors} />
                 </View>
-                <View style={styles.taskBlock}>
-                  <Text style={[styles.taskTitle, bodyBold]}>今日任务</Text>
-                  {todayTasks.length === 0 ? <Text style={[styles.hint, bodyFont]}>先点中间 + 添加一个任务。</Text> : null}
-                  {todayTasks.map((task) => (
-                    <Pressable key={task.id} style={styles.taskRow} onPress={() => toggleTaskDone(task.id)}>
-                      <Ionicons
-                        name={task.done ? 'checkmark-circle' : 'ellipse-outline'}
-                        size={18}
-                        color={task.done ? '#0F766E' : '#64748B'}
-                      />
-                      <Text
-                        style={[
-                          styles.taskText,
-                          task.done ? styles.taskTextDone : null,
-                          bodyFont,
-                        ]}
-                      >
-                        {task.title}
-                      </Text>
-                    </Pressable>
-                  ))}
-                  <Pressable
-                    style={styles.addTaskCenterBtn}
-                    onPress={() => {
-                      setTaskEditorOpen((prev) => !prev);
-                      if (taskEditorOpen) {
-                        setTaskTitle('');
-                        setTaskImage(null);
-                      }
-                    }}
-                  >
-                    <Ionicons name={taskEditorOpen ? 'remove' : 'add'} size={24} color="#F8FAFC" />
+
+                {visibleRecaps.length === 0 ? <Text style={[styles.emptyText, bodyFont, { color: colors.textTertiary }]}>先聊几句，系统会自动生成复盘。</Text> : null}
+
+                {visibleRecaps.map((item) => (
+                  <RecapCard key={item.id} item={item} colors={colors} bodyFont={bodyFont} bodyBold={bodyBold} isDark={isDark} />
+                ))}
+              </ScrollView>
+            </View>
+          ) : null}
+
+          {tab === 'me' ? (
+            <View style={[styles.flex, { backgroundColor: colors.background }]}>
+              <View style={[styles.recapTopBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}>
+                <Pressable style={styles.iconBlack} onPress={() => setTab('home')}>
+                  <RobotIcon name="back" size={16} color="#FF6B35" />
+                </Pressable>
+                <Text style={[styles.recapTopTitle, bodyMedium, { color: colors.textPrimary }]}>我的</Text>
+                <View style={styles.recapTopSpacer} />
+              </View>
+
+              <ScrollView style={styles.flex} contentContainerStyle={styles.profileContainer}>
+                <View style={[styles.profileCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+                  <Pressable style={styles.profileAvatarWrap} onPress={pickUserAvatar}>
+                    {identity?.userAvatarUrl ? (
+                      <Image source={{ uri: identity.userAvatarUrl }} style={styles.profileAvatarImage} />
+                    ) : (
+                      <View style={styles.profileAvatarPlaceholder}>
+                        <RobotIcon name="profile" size={30} color="#FF6B35" />
+                      </View>
+                    )}
+                    <View style={styles.profileAvatarBadge}>
+                      <RobotIcon name="camera" size={12} color="#FF6B35" />
+                    </View>
+                  </Pressable>
+                  <Text style={[styles.profileName, bodyBold, { color: colors.textPrimary }]}>{identity?.userName || inferUserName(authSession.user)}</Text>
+                  <Text style={[styles.profileEmail, bodyFont, { color: colors.textSecondary }]}>{authSession.user.email}</Text>
+                  <Pressable style={[styles.profilePrimaryAction, { backgroundColor: colors.accent }]} onPress={pickUserAvatar}>
+                    <Text style={[styles.profilePrimaryActionLabel, bodyMedium]}>更换头像</Text>
                   </Pressable>
                 </View>
 
-                {taskEditorOpen ? (
-                  <View style={styles.taskEditorCard}>
-                    <View style={styles.taskImageActions}>
-                      <Pressable style={styles.taskIconBtn} onPress={() => pickTaskImage('library')} disabled={taskAnalyzing}>
-                        <Ionicons name="images-outline" size={18} color="#0F172A" />
-                      </Pressable>
-                      <Pressable style={styles.taskIconBtn} onPress={() => pickTaskImage('camera')} disabled={taskAnalyzing}>
-                        <Ionicons name="camera-outline" size={18} color="#0F172A" />
-                      </Pressable>
+                <View style={[styles.profileCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+                  <ProfileRow label="你的称呼" value={identity?.userName || inferUserName(authSession.user)} font={bodyFont} colors={colors} />
+                  <ProfileRow label="伙伴名字" value={identity?.companionName || '贾维斯'} font={bodyFont} colors={colors} />
+                  <ProfileRow label="伙伴性别" value={identity?.companionGender || '中性'} font={bodyFont} colors={colors} />
+                  <ProfileRow label="自我介绍" value={identity?.userBio || '未填写'} font={bodyFont} colors={colors} />
+                  <Pressable style={[styles.profileSecondaryAction, { borderColor: colors.border }]} onPress={() => openIdentitySetup('me')}>
+                    <Text style={[styles.profileSecondaryActionLabel, bodyMedium, { color: colors.textPrimary }]}>编辑信息</Text>
+                  </Pressable>
+                </View>
+
+                <View style={[styles.profileCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+                  <Pressable style={styles.profileActionRow} onPress={toggleTheme}>
+                    <View style={styles.profileActionIcon}>
+                      <RobotIcon name={isDark ? 'sun' : 'moon'} size={13} color="#FF6B35" />
                     </View>
-
-                    {taskImage ? <Image source={{ uri: taskImage.uri }} style={styles.taskPreviewImage} /> : null}
-                    {taskAnalyzing ? (
-                      <View style={styles.taskAnalyzingRow}>
-                        <ActivityIndicator size="small" color="#0F766E" />
-                        <Text style={[styles.taskAnalyzingText, bodyFont]}>AI 正在自动分析图片并生成任务...</Text>
-                      </View>
-                    ) : null}
-
-                    <TextInput
-                      value={taskTitle}
-                      onChangeText={setTaskTitle}
-                      placeholder="任务名称（可手动修改）"
-                      placeholderTextColor="#94A3B8"
-                      style={[styles.taskInput, bodyFont]}
-                    />
-
-                    <Pressable onPress={saveTask} disabled={taskSaving || taskAnalyzing}>
-                      <LinearGradient colors={['#0F766E', '#0EA5E9']} style={styles.taskSaveBtn}>
-                        {taskSaving ? (
-                          <ActivityIndicator size="small" color="#F8FAFC" />
-                        ) : (
-                          <Text style={[styles.taskSaveText, bodyBold]}>保存</Text>
-                        )}
-                      </LinearGradient>
-                    </Pressable>
-                  </View>
-                ) : null}
-
-                <Field label="今天做成了什么" value={draft.wins} onChange={(text) => setDraft((prev) => ({ ...prev, wins: text }))} font={bodyFont} />
-                <Field label="今天的反思" value={draft.lessons} onChange={(text) => setDraft((prev) => ({ ...prev, lessons: text }))} font={bodyFont} />
-                <Field label="鏄庡ぉ鏈€閲嶈鐨勪簨" value={draft.focus} onChange={(text) => setDraft((prev) => ({ ...prev, focus: text }))} font={bodyFont} />
-                <Field label="鎰熸仼璁板綍" value={draft.gratitude} onChange={(text) => setDraft((prev) => ({ ...prev, gratitude: text }))} font={bodyFont} />
-                <Pressable onPress={onSaveJournal}>
-                  <LinearGradient colors={['#0F766E', '#155E75']} style={styles.save}>
-                    <Text style={[styles.saveText, bodyBold]}>保存并生成成长记录</Text>
-                  </LinearGradient>
-                </Pressable>
-              </View>
-            </ScrollView>
-          ) : null}
-
-          {tab === 'memory' ? (
-            <ScrollView style={styles.flex}>
-              <Text style={[styles.title, bodyBold]}>闀挎湡璁板繂</Text>
-              {state.facts.length === 0 ? <Text style={[styles.hint, bodyFont]}>暂无记忆片段，先去聊天或写日记。</Text> : null}
-              {state.facts.slice(0, 24).map((fact) => (
-                <View key={fact.id} style={styles.fact}>
-                  <Text style={[styles.factTag, { color: factColor(fact) }, bodyMedium]}>{categoryLabel(fact.category)}</Text>
-                  <Text style={[styles.factText, bodyFont]}>{fact.value}</Text>
+                    <Text style={[styles.profileActionLabel, bodyFont, { color: colors.textPrimary }]}>{isDark ? '切换到浅色模式' : '切换到深色模式'}</Text>
+                  </Pressable>
+                  <Pressable style={styles.profileActionRow} onPress={logout}>
+                    <View style={styles.profileActionIcon}>
+                      <RobotIcon name="logout" size={13} color="#FF6B35" />
+                    </View>
+                    <Text style={[styles.profileActionLabel, bodyFont, { color: colors.textPrimary }]}>退出登录</Text>
+                  </Pressable>
                 </View>
-              ))}
-            </ScrollView>
-          ) : null}
-
-          {tab === 'recap' ? (
-            <ScrollView style={styles.flex}>
-              <Text style={[styles.title, bodyBold]}>复盘中心</Text>
-              <Text style={[styles.hint, bodyFont]}>按日/周/月/年查看成长轨迹与下一步行动</Text>
-              <View style={styles.taskBoardCard}>
-                <Text style={[styles.taskBoardTitle, bodyBold]}>任务看板</Text>
-                <View style={styles.taskBoardGrid}>
-                  <TaskBoardMetric label="昨天完成" value={taskBoardStats.yesterdayDone} font={bodyMedium} />
-                  <TaskBoardMetric label="本周完成" value={taskBoardStats.weekDone} font={bodyMedium} />
-                  <TaskBoardMetric label="本月完成" value={taskBoardStats.monthDone} font={bodyMedium} />
-                  <TaskBoardMetric label="今年完成" value={taskBoardStats.yearDone} font={bodyMedium} />
-                </View>
-                <Text style={[styles.taskBoardCheer, bodyMedium]}>{taskInsight.cheer}</Text>
-                <Text style={[styles.taskBoardLine, bodyFont]}>{taskInsight.solved}</Text>
-                <Text style={[styles.taskBoardLine, bodyFont]}>{taskInsight.next}</Text>
-                <View style={styles.taskBoardAiWrap}>
-                  <Text style={[styles.taskBoardAiTitle, bodyBold]}>AI 复盘建议</Text>
-                  {taskAiBusy ? <ActivityIndicator size="small" color="#0F766E" /> : null}
-                  <Text style={[styles.taskBoardAiText, bodyFont]}>
-                    {taskAiSummary || '整理中...'}
-                  </Text>
-                </View>
-              </View>
-              <View style={styles.recapFilters}>
-                <RecapFilterButton
-                  label="日"
-                  active={recapPeriod === 'day'}
-                  onPress={() => setRecapPeriod('day')}
-                  font={bodyMedium}
-                />
-                <RecapFilterButton
-                  label="周"
-                  active={recapPeriod === 'week'}
-                  onPress={() => setRecapPeriod('week')}
-                  font={bodyMedium}
-                />
-                <RecapFilterButton
-                  label="月"
-                  active={recapPeriod === 'month'}
-                  onPress={() => setRecapPeriod('month')}
-                  font={bodyMedium}
-                />
-                <RecapFilterButton
-                  label="年"
-                  active={recapPeriod === 'year'}
-                  onPress={() => setRecapPeriod('year')}
-                  font={bodyMedium}
-                />
-              </View>
-
-              {visibleRecaps.length === 0 ? (
-                <Text style={[styles.hint, bodyFont]}>先写几条日记，系统会自动生成日周月年复盘。</Text>
-              ) : null}
-              {visibleRecaps.map((item) => (
-                <View key={item.id} style={styles.recapCard}>
-                  <LinearGradient colors={['#DBEAFE', '#ECFEFF']} style={styles.recapHead}>
-                    <Text style={[styles.recapLabel, bodyBold]}>{item.label}</Text>
-                    <Text style={[styles.recapMeta, bodyFont]}>
-                      {item.startDate === item.endDate ? item.startDate : `${item.startDate} ~ ${item.endDate}`}
-                    </Text>
-                  </LinearGradient>
-                  <Text style={[styles.recapSummary, bodyFont]}>{item.summary}</Text>
-                  <RecapList title="亮点" items={item.highlights} font={bodyFont} />
-                  <RecapList title="低谷/卡点" items={item.lowlights} font={bodyFont} />
-                  <RecapList title="下一步" items={item.actions} font={bodyFont} />
-                </View>
-              ))}
-            </ScrollView>
+              </ScrollView>
+              {notice ? <Text style={[styles.notice, bodyFont]}>{notice}</Text> : null}
+            </View>
           ) : null}
         </View>
-
-        <BlurView intensity={35} tint="light" style={styles.tabs}>
-          <Tab label="鑱婂ぉ" icon="chatbubble-ellipses-outline" active={tab === 'chat'} onPress={() => setTab('chat')} font={bodyMedium} />
-          <Tab label="鏃ヨ" icon="create-outline" active={tab === 'journal'} onPress={() => setTab('journal')} font={bodyMedium} />
-          <Tab label="璁板繂" icon="albums-outline" active={tab === 'memory'} onPress={() => setTab('memory')} font={bodyMedium} />
-          <Tab label="复盘" icon="stats-chart-outline" active={tab === 'recap'} onPress={() => setTab('recap')} font={bodyMedium} />
-        </BlurView>
       </SafeAreaView>
-    </LinearGradient>
+    </View>
   );
 }
 
 function AuthScreen({
   mode,
   setMode,
-  name,
-  setName,
   email,
   setEmail,
   password,
@@ -1200,15 +1848,12 @@ function AuthScreen({
   busy,
   error,
   onSubmit,
-  titleFont,
   bodyFont,
   bodyMedium,
   bodyBold,
 }: {
   mode: AuthMode;
   setMode: (mode: AuthMode) => void;
-  name: string;
-  setName: (value: string) => void;
   email: string;
   setEmail: (value: string) => void;
   password: string;
@@ -1216,95 +1861,95 @@ function AuthScreen({
   busy: boolean;
   error: string;
   onSubmit: () => void;
-  titleFont: { fontFamily: string };
-  bodyFont: { fontFamily: string };
-  bodyMedium: { fontFamily: string };
-  bodyBold: { fontFamily: string };
+  bodyFont: FontStyle;
+  bodyMedium: FontStyle;
+  bodyBold: FontStyle;
 }) {
-  return (
-    <LinearGradient colors={['#0B1220', '#1E293B', '#0F172A']} style={styles.authRoot}>
-      <StatusBar style="light" />
-      <View style={[styles.authOrb, styles.authOrbA]} />
-      <View style={[styles.authOrb, styles.authOrbB]} />
-      <SafeAreaView style={styles.authSafe}>
-        <Text style={[styles.authBrand, titleFont]}>GrowUp</Text>
-        <Text style={[styles.authTagline, bodyMedium]}>Your AI Companion For Lifelong Growth</Text>
+  // 淡入动画
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  
+  useEffect(() => {
+    Animated.timing(fadeAnim, {
+      toValue: 1,
+      duration: 600,
+      useNativeDriver: true,
+    }).start();
+  }, []);
 
-        <BlurView intensity={40} tint="dark" style={styles.authCard}>
-          <View style={styles.authMode}>
-            <Pressable
-              style={[styles.authModeBtn, mode === 'login' ? styles.authModeBtnActive : null]}
-              onPress={() => setMode('login')}
+  return (
+    <View style={styles.authRoot}>
+      <StatusBar style="dark" />
+      <SafeAreaView style={styles.authSafe}>
+        <Animated.View style={{ opacity: fadeAnim, flex: 1, justifyContent: 'center' }}>
+          {/* 品牌区域 */}
+          <View style={styles.authBrandWrap}>
+            <LinearGradient
+              colors={['#0A0A0A', '#262626']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.authLogo}
             >
-              <Text style={[styles.authModeLabel, mode === 'login' ? styles.authModeLabelActive : null, bodyMedium]}>
-                鐧诲綍
-              </Text>
-            </Pressable>
-            <Pressable
-              style={[styles.authModeBtn, mode === 'register' ? styles.authModeBtnActive : null]}
-              onPress={() => setMode('register')}
-            >
-              <Text
-                style={[
-                  styles.authModeLabel,
-                  mode === 'register' ? styles.authModeLabelActive : null,
-                  bodyMedium,
-                ]}
-              >
-                娉ㄥ唽
-              </Text>
-            </Pressable>
+              {/* 机械感机器人图标 */}
+              <View style={styles.robotIcon}>
+                <View style={styles.robotHead}>
+                  <View style={styles.robotEye} />
+                  <View style={styles.robotEye} />
+                </View>
+                <View style={styles.robotMouth} />
+              </View>
+            </LinearGradient>
+            <Text style={[styles.authBrand, bodyBold]}>TIANBO robot</Text>
+            <Text style={[styles.authTagline, bodyMedium]}>你的AI伙伴，陪伴成长</Text>
+            <Text style={[styles.authTaglineSub, bodyFont]}>—— 陪伴你成长的AI伙伴 ——</Text>
           </View>
 
-          {mode === 'register' ? (
-            <AuthInput
-              icon="person-outline"
-              placeholder="浣犵殑鏄电О锛堝彲閫夛級"
-              value={name}
-              onChange={setName}
-              bodyFont={bodyFont}
-            />
-          ) : null}
-          <AuthInput icon="mail-outline" placeholder="閭" value={email} onChange={setEmail} bodyFont={bodyFont} />
-          <AuthInput
-            icon="lock-closed-outline"
-            placeholder="瀵嗙爜"
-            value={password}
-            onChange={setPassword}
-            bodyFont={bodyFont}
-            secureTextEntry
-          />
+          {/* 玻璃拟态卡片 */}
+          <View style={styles.authCard}>
+            <View style={styles.authMode}>
+              <Pressable style={[styles.authModeBtn, mode === 'login' ? styles.authModeBtnActive : null]} onPress={() => setMode('login')}>
+                <Text style={[styles.authModeLabel, mode === 'login' ? styles.authModeLabelActive : null, bodyMedium]}>登录</Text>
+              </Pressable>
+              <Pressable style={[styles.authModeBtn, mode === 'register' ? styles.authModeBtnActive : null]} onPress={() => setMode('register')}>
+                <Text style={[styles.authModeLabel, mode === 'register' ? styles.authModeLabelActive : null, bodyMedium]}>注册</Text>
+              </Pressable>
+            </View>
 
-          {error ? <Text style={[styles.authError, bodyFont]}>{error}</Text> : null}
+            <AuthInput icon="mail" placeholder="邮箱" value={email} onChange={setEmail} bodyFont={bodyFont} />
+            <AuthInput icon="lock" placeholder="密码" value={password} onChange={setPassword} bodyFont={bodyFont} secureTextEntry />
 
-          <Pressable onPress={onSubmit} disabled={busy}>
-            <LinearGradient colors={['#06B6D4', '#0EA5E9']} style={styles.authSubmit}>
-              {busy ? (
-                <ActivityIndicator size="small" color="#F8FAFC" />
-              ) : (
-                <Text style={[styles.authSubmitLabel, bodyBold]}>
-                  {mode === 'register' ? '创建并进入' : '登录并进入'}
-                </Text>
-              )}
-            </LinearGradient>
-          </Pressable>
+            {error ? <Text style={[styles.authError, bodyFont]}>{error}</Text> : null}
 
-          <Text style={[styles.authHint, bodyFont]}>你的图片与聊天会按账号隔离存储在云端 PocketBase。</Text>
-        </BlurView>
+            <Pressable onPress={onSubmit} disabled={busy}>
+              <LinearGradient
+                colors={['#0A0A0A', '#262626']}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={styles.authSubmit}
+              >
+                    {busy ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text style={[styles.authSubmitLabel, bodyBold]}>{mode === 'register' ? '创建账号' : '进入TIANBO'}</Text>}
+              </LinearGradient>
+            </Pressable>
+
+            <Text style={[styles.authHint, bodyFont]}>聊天、图片和复盘会按账号隔离保存。</Text>
+          </View>
+        </Animated.View>
       </SafeAreaView>
-    </LinearGradient>
+    </View>
   );
 }
-
 function IdentitySetupScreen({
   userName,
   setUserName,
   companionName,
   setCompanionName,
+  companionGender,
+  setCompanionGender,
   userBio,
   setUserBio,
   busy,
   onSubmit,
+  allowCancel,
+  onCancel,
   titleFont,
   bodyFont,
   bodyMedium,
@@ -1314,97 +1959,294 @@ function IdentitySetupScreen({
   setUserName: (value: string) => void;
   companionName: string;
   setCompanionName: (value: string) => void;
+  companionGender: string;
+  setCompanionGender: (value: string) => void;
   userBio: string;
   setUserBio: (value: string) => void;
   busy: boolean;
   onSubmit: () => void;
-  titleFont: { fontFamily: string };
-  bodyFont: { fontFamily: string };
-  bodyMedium: { fontFamily: string };
-  bodyBold: { fontFamily: string };
+  allowCancel: boolean;
+  onCancel: () => void;
+  titleFont: FontStyle;
+  bodyFont: FontStyle;
+  bodyMedium: FontStyle;
+  bodyBold: FontStyle;
 }) {
-  const [step, setStep] = useState<1 | 2>(1);
-  const companion = companionName.trim() || '贾维斯';
-
-  const onNext = () => {
-    if (!companionName.trim()) {
-      setCompanionName('贾维斯');
-    }
-    setStep(2);
+  const partner = companionName.trim() || '贾维斯';
+  const genderOptions = ['男', '女', '中性'];
+  const onConfirmSubmit = () => {
+    if (busy) return;
+    Keyboard.dismiss();
+    requestAnimationFrame(() => onSubmit());
   };
+  
+  // 淡入动画
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const slideAnim = useRef(new Animated.Value(30)).current;
+  
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 500,
+        useNativeDriver: true,
+      }),
+      Animated.timing(slideAnim, {
+        toValue: 0,
+        duration: 500,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, []);
 
   return (
-    <LinearGradient colors={['#0F172A', '#1F2937', '#111827']} style={styles.identityRoot}>
-      <StatusBar style="light" />
+    <View style={styles.identityRoot}>
+      <StatusBar style="dark" />
       <SafeAreaView style={styles.identitySafe}>
-        <Text style={[styles.identityBrand, titleFont]}>First Ritual</Text>
-        <Text style={[styles.identitySub, bodyMedium]}>
-          先完成第一次对话，你和伙伴就正式上线了
-        </Text>
-
-        <BlurView intensity={36} tint="dark" style={styles.identityCard}>
-          {step === 1 ? (
-            <>
-              <Text style={[styles.identityTitle, bodyBold]}>先给你的 AI 伙伴取个名字</Text>
-              <AuthInput
-                icon="sparkles-outline"
-                placeholder="推荐：贾维斯"
-                value={companionName}
-                onChange={setCompanionName}
-                bodyFont={bodyFont}
-              />
-              <Text style={[styles.identityHint, bodyFont]}>
-                名字会被长期记住，后续所有聊天都会用这个身份陪伴你。
-              </Text>
-              <Pressable onPress={onNext} disabled={busy}>
-                <LinearGradient colors={['#14B8A6', '#0EA5E9']} style={styles.identitySubmit}>
-                  <Text style={[styles.identitySubmitLabel, bodyBold]}>下一步</Text>
+        <KeyboardAvoidingView
+          style={styles.flex}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          keyboardVerticalOffset={Platform.OS === 'ios' ? 18 : 0}
+        >
+          <ScrollView
+            style={styles.flex}
+            contentContainerStyle={styles.identityScrollContent}
+            showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+          >
+            <Animated.View style={[styles.identityContentWrap, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
+              {/* 品牌标识 */}
+              <View style={styles.identityLogoWrap}>
+                <LinearGradient
+                  colors={['#0A0A0A', '#262626']}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 1 }}
+                  style={styles.identityLogo}
+                >
+                  {/* 机械感机器人图标 */}
+                  <View style={styles.robotIcon}>
+                    <View style={styles.robotHead}>
+                      <View style={styles.robotEye} />
+                      <View style={styles.robotEye} />
+                    </View>
+                    <View style={styles.robotMouth} />
+                  </View>
                 </LinearGradient>
-              </Pressable>
-            </>
-          ) : (
-            <>
-              <View style={styles.identityBotBubble}>
-                <Text style={[styles.identityBotText, bodyFont]}>
-                  {`你好，我是${companion}。我想更了解你：希望我怎么称呼你？也请介绍一下你自己。`}
-                </Text>
+                <Text style={[styles.identityBrand, titleFont]}>{allowCancel ? '资料设置' : '首次设定'}</Text>
+                <Text style={[styles.identitySub, bodyMedium]}>{allowCancel ? '修改后将立即生效' : '完成设定后，你的伙伴就正式上线啦'}</Text>
               </View>
 
-              <Text style={[styles.identityTitle, bodyBold]}>你希望我怎么称呼你？</Text>
-              <AuthInput
-                icon="person-outline"
-                placeholder="比如：阿森 / 小雨"
-                value={userName}
-                onChange={setUserName}
-                bodyFont={bodyFont}
-              />
+              <View style={styles.identityCard}>
+                {allowCancel ? (
+                  <Pressable style={styles.identityBackBtn} onPress={onCancel}>
+                    <RobotIcon name="back" size={14} color="#FF6B35" />
+                    <Text style={[styles.identityBackLabel, bodyFont]}>返回聊天</Text>
+                  </Pressable>
+                ) : null}
+                <Text style={[styles.identityTitle, bodyBold]}>先给你的伙伴取个名字</Text>
+                <AuthInput icon="sparkles" placeholder="推荐：贾维斯" value={companionName} onChange={setCompanionName} bodyFont={bodyFont} />
 
-              <Text style={[styles.identityTitle, bodyBold]}>再介绍一下你自己（可选）</Text>
-              <TextInput
-                value={userBio}
-                onChangeText={setUserBio}
-                multiline
-                placeholder="比如：我目前最想提升执行力，容易拖延..."
-                placeholderTextColor="#64748B"
-                style={[styles.identityBioInput, bodyFont]}
-              />
+                <Text style={[styles.identityTitle, bodyBold]}>Ta 的性别设定</Text>
+                <View style={styles.identityOptionRow}>
+                  {genderOptions.map((option) => {
+                    const active = (companionGender || '中性') === option;
+                    return (
+                      <Pressable
+                        key={option}
+                        style={[styles.identityOptionChip, active ? styles.identityOptionChipActive : null]}
+                        onPress={() => setCompanionGender(option)}
+                        disabled={busy}
+                      >
+                        <Text style={[styles.identityOptionChipText, bodyFont, active ? styles.identityOptionChipTextActive : null]}>{option}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
 
-              <Pressable onPress={onSubmit} disabled={busy}>
-                <LinearGradient colors={['#14B8A6', '#0EA5E9']} style={styles.identitySubmit}>
-                  {busy ? (
-                    <ActivityIndicator size="small" color="#F8FAFC" />
-                  ) : (
-                    <Text style={[styles.identitySubmitLabel, bodyBold]}>确认并开始</Text>
-                  )}
-                </LinearGradient>
-              </Pressable>
-            </>
-          )}
-        </BlurView>
+                <View style={[styles.identityBubble, { backgroundColor: '#FFF4EF', borderColor: '#FF6B35' }]}>
+                  <Text style={[styles.identityBubbleText, bodyFont]}>
+                    {`你好，我是${partner}。我想更了解你：希望我怎么称呼你？也请介绍一下你自己。`}
+                  </Text>
+                </View>
+
+                <Text style={[styles.identityTitle, bodyBold]}>你希望我怎么称呼你？</Text>
+                <AuthInput icon="profile" placeholder="比如：阿森 / 小雨" value={userName} onChange={setUserName} bodyFont={bodyFont} />
+
+                <Text style={[styles.identityTitle, bodyBold]}>再介绍一下你自己（可选）</Text>
+                <TextInput
+                  value={userBio}
+                  onChangeText={setUserBio}
+                  multiline
+                  placeholder="比如：我现在最想提升执行力，容易拖延…"
+                  placeholderTextColor="#A3A3A3"
+                  style={[styles.identityBioInput, bodyFont]}
+                />
+
+                <Text style={[styles.identityHint, bodyFont]}>这个名字会被长期记住，后续聊天都会使用这个身份。</Text>
+
+                <Pressable onPress={onConfirmSubmit} disabled={busy}>
+                  <LinearGradient
+                    colors={['#0A0A0A', '#262626']}
+                    start={{ x: 0, y: 0 }}
+                    end={{ x: 1, y: 1 }}
+                    style={styles.identitySubmit}
+                  >
+                    {busy ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text style={[styles.identitySubmitLabel, bodyBold]}>确认并开始</Text>}
+                  </LinearGradient>
+                </Pressable>
+              </View>
+            </Animated.View>
+          </ScrollView>
+        </KeyboardAvoidingView>
       </SafeAreaView>
-    </LinearGradient>
+    </View>
   );
 }
+
+// 消息气泡组件 - 带头像
+const MessageBubble = memo(function MessageBubble({ 
+  msg, 
+  isNew,
+  selectionMode,
+  selected,
+  onPress,
+  onLongPress,
+  colors, 
+  bodyFont, 
+  isDark,
+  userAvatarUrl
+}: { 
+  msg: ChatMessage; 
+  isNew: boolean;
+  selectionMode: boolean;
+  selected: boolean;
+  onPress: (messageId: string) => void;
+  onLongPress: (messageId: string) => void;
+  colors: Colors; 
+  bodyFont: FontStyle; 
+  isDark: boolean;
+  userAvatarUrl?: string;
+}) {
+  const fadeAnim = useRef(new Animated.Value(isNew ? 0 : 1)).current;
+  const parsedMessage = parseQuotedMessageText(msg.text || '');
+  const renderedText = parsedMessage.body || msg.text;
+
+  useEffect(() => {
+    if (isNew) {
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 200,
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [isNew]);
+
+  const isAi = msg.role === 'assistant';
+  
+  const bubbleContent = (
+    <>
+      {parsedMessage.quote ? (
+        <View style={[styles.msgQuoteBlock, isAi ? styles.msgQuoteBlockAi : styles.msgQuoteBlockUser]}>
+          <Text style={[styles.msgQuoteLabel, bodyFont, isAi ? styles.msgQuoteLabelAi : styles.msgQuoteLabelUser]}>
+            回复{parsedMessage.quote.role === 'assistant' ? 'AI' : '我'}
+          </Text>
+          <Text
+            numberOfLines={2}
+            style={[styles.msgQuoteText, bodyFont, isAi ? styles.msgQuoteTextAi : styles.msgQuoteTextUser]}
+          >
+            {parsedMessage.quote.text}
+          </Text>
+        </View>
+      ) : null}
+      {msg.imageUri ? <Image source={{ uri: msg.imageUri }} style={styles.msgImage} /> : null}
+      <Text style={[styles.msgText, isAi ? styles.aiText : styles.userText, bodyFont]}>{renderedText}</Text>
+      <Text style={[styles.msgTime, isAi ? styles.aiTime : styles.userTime, bodyFont]}>
+        {formatClock(msg.createdAt)}
+      </Text>
+    </>
+  );
+
+  // AI头像 - 机器人图标
+  const aiAvatar = (
+    <View style={styles.avatarContainer}>
+      <View style={styles.aiAvatar}>
+        <View style={styles.avatarRobotIcon}>
+          <View style={styles.avatarRobotHead}>
+            <View style={styles.avatarRobotEye} />
+            <View style={styles.avatarRobotEye} />
+          </View>
+          <View style={styles.avatarRobotMouth} />
+        </View>
+      </View>
+    </View>
+  );
+
+  // 用户头像
+  const userAvatar = (
+    <View style={styles.avatarContainer}>
+      {userAvatarUrl ? (
+        <Image source={{ uri: userAvatarUrl }} style={styles.userAvatarImage} />
+      ) : (
+        <View style={styles.defaultUserAvatar}>
+          <RobotIcon name="profile" size={16} color="#FF6B35" />
+        </View>
+      )}
+    </View>
+  );
+
+  const selectionMarker = selectionMode ? (
+    <View style={[styles.msgSelectMark, selected ? styles.msgSelectMarkActive : null]}>
+      {selected ? <View style={styles.msgSelectMarkDot} /> : null}
+    </View>
+  ) : null;
+
+  return (
+    <Pressable onPress={() => onPress(msg.id)} onLongPress={() => onLongPress(msg.id)} delayLongPress={260}>
+      <Animated.View
+        style={[
+          styles.msgRowWithAvatar,
+          isAi ? styles.left : styles.right,
+          { opacity: fadeAnim },
+        ]}
+      >
+        {isAi ? (
+          <>
+            {selectionMarker}
+            {aiAvatar}
+            <View style={selected ? styles.msgBubbleSelectedWrap : null}>
+              <LinearGradient
+                colors={isDark ? ['#1A1A1A', '#0A0A0A'] : ['#0A0A0A', '#262626']}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={[styles.msgBubble, styles.aiBubble]}
+              >
+                {bubbleContent}
+              </LinearGradient>
+            </View>
+          </>
+        ) : (
+          <>
+            <View
+              style={[
+                styles.msgBubble,
+                styles.userBubble,
+                {
+                  backgroundColor: colors.surface,
+                  borderColor: selected ? '#FF6B35' : colors.border,
+                },
+              ]}
+            >
+              {bubbleContent}
+            </View>
+            {userAvatar}
+            {selectionMarker}
+          </>
+        )}
+      </Animated.View>
+    </Pressable>
+  );
+});
 
 function AuthInput({
   icon,
@@ -1414,16 +2256,16 @@ function AuthInput({
   bodyFont,
   secureTextEntry,
 }: {
-  icon: keyof typeof Ionicons.glyphMap;
+  icon: RobotIconName;
   placeholder: string;
   value: string;
   onChange: (text: string) => void;
-  bodyFont: { fontFamily: string };
+  bodyFont: FontStyle;
   secureTextEntry?: boolean;
 }) {
   return (
     <View style={styles.authInputWrap}>
-      <Ionicons name={icon} size={16} color="#94A3B8" />
+      <RobotIcon name={icon} size={16} color="#FF6B35" />
       <TextInput
         value={value}
         onChangeText={onChange}
@@ -1437,59 +2279,22 @@ function AuthInput({
   );
 }
 
-function Metric({ label, value, font }: { label: string; value: string; font: { fontFamily: string } }) {
-  return (
-    <View style={styles.metric}>
-      <Text style={[styles.metricLabel, font]}>{label}</Text>
-      <Text style={[styles.metricValue, font]}>{value}</Text>
-    </View>
-  );
-}
-
-function Field({
+function ProfileRow({
   label,
   value,
-  onChange,
   font,
+  colors,
 }: {
   label: string;
   value: string;
-  onChange: (value: string) => void;
-  font: { fontFamily: string };
+  font: FontStyle;
+  colors: Colors;
 }) {
   return (
-    <View style={styles.field}>
-      <Text style={[styles.fieldLabel, { fontFamily: 'SpaceGrotesk_500Medium' }]}>{label}</Text>
-      <TextInput
-        value={value}
-        onChangeText={onChange}
-        multiline
-        placeholder="鍐欎笅浣犵殑鐪熷疄鎯虫硶..."
-        placeholderTextColor="#94A3B8"
-        style={[styles.fieldInput, font]}
-      />
+    <View style={[styles.profileRow, { borderBottomColor: colors.borderLight }]}>
+      <Text style={[styles.profileRowLabel, font, { color: colors.textTertiary }]}>{label}</Text>
+      <Text style={[styles.profileRowValue, font, { color: colors.textPrimary }]}>{value}</Text>
     </View>
-  );
-}
-
-function Tab({
-  label,
-  icon,
-  active,
-  onPress,
-  font,
-}: {
-  label: string;
-  icon: keyof typeof Ionicons.glyphMap;
-  active: boolean;
-  onPress: () => void;
-  font: { fontFamily: string };
-}) {
-  return (
-    <Pressable style={[styles.tab, active ? styles.tabActive : null]} onPress={onPress}>
-      <Ionicons name={icon} size={17} color={active ? '#F8FAFC' : '#0F172A'} />
-      <Text style={[styles.tabLabel, { color: active ? '#F8FAFC' : '#0F172A' }, font]}>{label}</Text>
-    </Pressable>
   );
 }
 
@@ -1498,629 +2303,878 @@ function RecapFilterButton({
   active,
   onPress,
   font,
+  isDark,
+  colors,
 }: {
   label: string;
   active: boolean;
   onPress: () => void;
-  font: { fontFamily: string };
+  font: FontStyle;
+  isDark: boolean;
+  colors: Colors;
 }) {
   return (
-    <Pressable style={[styles.recapFilterBtn, active ? styles.recapFilterBtnActive : null]} onPress={onPress}>
-      <Text style={[styles.recapFilterLabel, active ? styles.recapFilterLabelActive : null, font]}>{label}</Text>
+    <Pressable 
+      style={[
+        styles.recapFilterBtn, 
+        active ? styles.recapFilterBtnActive : null,
+        active && { backgroundColor: colors.surface }
+      ]} 
+      onPress={onPress}
+    >
+      {active ? (
+        <LinearGradient
+          colors={['#0A0A0A', '#262626']}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={styles.recapFilterGradient}
+        >
+          <Text style={[styles.recapFilterLabelActive, font]}>{label}</Text>
+        </LinearGradient>
+      ) : (
+        <Text style={[styles.recapFilterLabel, { color: colors.textSecondary }, font]}>{label}</Text>
+      )}
     </Pressable>
   );
 }
 
-function RecapList({
-  title,
-  items,
-  font,
-}: {
-  title: string;
-  items: string[];
-  font: { fontFamily: string };
+// 复盘卡片组件
+function RecapCard({ 
+  item, 
+  colors, 
+  bodyFont, 
+  bodyBold, 
+  isDark 
+}: { 
+  item: PeriodicRecap; 
+  colors: Colors; 
+  bodyFont: FontStyle;
+  bodyBold: FontStyle;
+  isDark: boolean;
 }) {
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.timing(fadeAnim, {
+      toValue: 1,
+      duration: 400,
+      useNativeDriver: true,
+    }).start();
+  }, []);
+
+  return (
+    <Animated.View style={{ opacity: fadeAnim }}>
+      <View style={[styles.recapCard, { 
+        backgroundColor: colors.surface, 
+        borderColor: colors.border 
+      }]}>
+        <LinearGradient
+          colors={isDark ? ['#1A1A1A', '#0A0A0A'] : ['#FAFAFA', '#F5F5F5']}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={styles.recapHead}
+        >
+          <Text style={[styles.recapLabel, bodyBold, { color: colors.textPrimary }]}>{item.label}</Text>
+          <Text style={[styles.recapMeta, bodyFont, { color: colors.textTertiary }]}>
+            {item.startDate === item.endDate ? item.startDate : `${item.startDate} - ${item.endDate}`}
+          </Text>
+        </LinearGradient>
+        <RecapList title="这一天干了什么" items={[item.summary]} font={bodyFont} colors={colors} />
+        <RecapList title="重要的事" items={item.highlights} font={bodyFont} colors={colors} />
+        <RecapList title="要做的事情" items={item.actions} font={bodyFont} colors={colors} />
+        <RecapList title="里程碑" items={item.milestones || []} font={bodyFont} colors={colors} />
+        <RecapList title="有哪些成长" items={item.growths || []} font={bodyFont} colors={colors} />
+      </View>
+    </Animated.View>
+  );
+}
+
+function RecapList({ title, items, font, colors }: { title: string; items: string[]; font: FontStyle; colors: Colors }) {
   if (!items || items.length === 0) return null;
   return (
     <View style={styles.recapSection}>
       <Text style={[styles.recapSectionTitle, font]}>{title}</Text>
       {items.map((item) => (
-        <Text key={`${title}-${item}`} style={[styles.recapItem, font]}>
+        <Text key={`${title}-${item}`} style={[styles.recapItem, font, { color: colors.textPrimary }]}>
           • {item}
         </Text>
       ))}
     </View>
   );
 }
-
-function TaskBoardMetric({
-  label,
-  value,
-  font,
-}: {
-  label: string;
-  value: number;
-  font: { fontFamily: string };
-}) {
-  return (
-    <View style={styles.taskBoardMetric}>
-      <Text style={[styles.taskBoardMetricValue, font]}>{value}</Text>
-      <Text style={[styles.taskBoardMetricLabel, font]}>{label}</Text>
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
   root: { flex: 1 },
-  safe: { flex: 1, padding: 12 },
-  loading: {
-    flex: 1,
+  safe: { flex: 1, paddingHorizontal: 12, paddingTop: 6, paddingBottom: 10 },
+  loading: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F5F5F7' },
+
+  authRoot: { flex: 1, backgroundColor: '#FFFFFF' },
+  authSafe: { flex: 1, justifyContent: 'center', paddingHorizontal: 28, paddingBottom: 20 },
+  // 品牌区域
+  authBrandWrap: { alignItems: 'center', marginBottom: 8 },
+  authLogo: { 
+    width: 72, 
+    height: 72, 
+    borderRadius: 36, 
+    backgroundColor: '#FFFFFF', 
+    alignItems: 'center', 
     justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#F8FAFC',
-  },
-  authRoot: { flex: 1 },
-  authSafe: { flex: 1, justifyContent: 'center', paddingHorizontal: 18 },
-  authOrb: { position: 'absolute', borderRadius: 999 },
-  authOrbA: {
-    width: 280,
-    height: 280,
-    backgroundColor: 'rgba(6,182,212,0.24)',
-    right: -100,
-    top: -60,
-  },
-  authOrbB: {
-    width: 220,
-    height: 220,
-    backgroundColor: 'rgba(249,115,22,0.20)',
-    left: -90,
-    bottom: -30,
-  },
-  authBrand: { fontSize: 46, color: '#F8FAFC', textAlign: 'center' },
-  authTagline: {
-    fontSize: 13,
-    color: '#E2E8F0',
-    textAlign: 'center',
-    letterSpacing: 0.4,
-    marginTop: 4,
     marginBottom: 16,
+    shadowColor: '#FF6B35',
+    shadowOpacity: 0.4,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
+    borderWidth: 2,
+    borderColor: '#FF6B35',
   },
-  authCard: {
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: 'rgba(148,163,184,0.35)',
-    backgroundColor: 'rgba(15,23,42,0.46)',
-    padding: 14,
+  // 机械感机器人图标
+  robotIcon: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  robotHead: {
+    flexDirection: 'row',
     gap: 10,
+    marginBottom: 6,
   },
-  authMode: {
-    flexDirection: 'row',
-    backgroundColor: 'rgba(15,23,42,0.65)',
-    borderRadius: 12,
-    padding: 4,
-    gap: 4,
+  robotEye: {
+    width: 10,
+    height: 10,
+    borderRadius: 2,
+    backgroundColor: '#FF6B35',
   },
-  authModeBtn: {
-    flex: 1,
-    borderRadius: 9,
-    paddingVertical: 8,
-    alignItems: 'center',
+  robotMouth: {
+    width: 20,
+    height: 4,
+    borderRadius: 1,
+    backgroundColor: '#FF6B35',
   },
-  authModeBtnActive: {
-    backgroundColor: 'rgba(14,165,233,0.75)',
-  },
-  authModeLabel: {
-    color: '#CBD5E1',
-    fontSize: 13,
-  },
-  authModeLabelActive: {
-    color: '#F8FAFC',
-  },
-  authInputWrap: {
-    borderRadius: 12,
+  authBrand: { fontSize: 32, color: '#0A0A0A', textAlign: 'center', letterSpacing: 0.5, fontWeight: '700' },
+  authTagline: { fontSize: 14, color: '#525252', textAlign: 'center', letterSpacing: 0.3, marginTop: 8 },
+  authTaglineSub: { fontSize: 12, color: '#A3A3A3', textAlign: 'center', marginTop: 6, marginBottom: 28 },
+  // 玻璃拟态卡片
+  authCard: {
+    borderRadius: 28,
     borderWidth: 1,
-    borderColor: 'rgba(148,163,184,0.35)',
-    backgroundColor: 'rgba(15,23,42,0.65)',
-    paddingHorizontal: 10,
-    height: 46,
+    borderColor: '#E5E5E5',
+    backgroundColor: '#FFFFFF',
+    padding: 22,
+    gap: 14,
+    shadowColor: '#0A0A0A',
+    shadowOpacity: 0.08,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 4,
+  },
+  authMode: { flexDirection: 'row', backgroundColor: '#F5F5F5', borderRadius: 16, padding: 4, gap: 4 },
+  authModeBtn: { flex: 1, borderRadius: 12, paddingVertical: 11, alignItems: 'center' },
+  authModeBtnActive: {
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#FF6B35',
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+  authModeLabel: { color: '#525252', fontSize: 14 },
+  authModeLabelActive: { color: '#FF6B35', fontWeight: '600' },
+  // 输入框 - 玻璃质感
+  authInputWrap: {
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: '#E5E5E5',
+    backgroundColor: '#FAFAFA',
+    paddingHorizontal: 14,
+    paddingVertical: 0,
+    height: 52,
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 8,
+    gap: 10,
   },
   authInput: {
     flex: 1,
-    color: '#F8FAFC',
-    fontSize: 14,
+    color: '#2D3436',
+    fontSize: 15,
+    lineHeight: 20,
+    paddingVertical: 0,
+    textAlignVertical: 'center',
+    includeFontPadding: false,
   },
-  authError: {
-    color: '#FCA5A5',
-    fontSize: 12,
-  },
-  authSubmit: {
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    height: 46,
-  },
-  authSubmitLabel: {
-    color: '#F8FAFC',
-    fontSize: 14,
-  },
-  authHint: {
-    fontSize: 11,
-    color: '#CBD5E1',
-    lineHeight: 16,
-  },
-  identityRoot: { flex: 1 },
-  identitySafe: { flex: 1, justifyContent: 'center', paddingHorizontal: 18 },
-  identityBrand: { fontSize: 44, color: '#F8FAFC', textAlign: 'center' },
-  identitySub: {
-    fontSize: 13,
-    color: '#E2E8F0',
-    textAlign: 'center',
-    marginTop: 4,
-    marginBottom: 16,
-  },
-  identityCard: {
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: 'rgba(148,163,184,0.35)',
-    backgroundColor: 'rgba(15,23,42,0.46)',
-    padding: 14,
-    gap: 10,
-  },
-  identityTitle: {
-    marginTop: 2,
-    fontSize: 14,
-    color: '#F8FAFC',
-  },
-  identityHint: {
-    fontSize: 11,
-    color: '#CBD5E1',
-    lineHeight: 16,
-  },
-  identityBotBubble: {
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(125,211,252,0.45)',
-    backgroundColor: 'rgba(30,41,59,0.75)',
-    paddingHorizontal: 10,
-    paddingVertical: 9,
-    marginBottom: 2,
-  },
-  identityBotText: {
-    fontSize: 12,
-    color: '#E2E8F0',
-    lineHeight: 18,
-  },
-  identityBioInput: {
-    minHeight: 90,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(148,163,184,0.35)',
-    backgroundColor: 'rgba(15,23,42,0.65)',
-    color: '#F8FAFC',
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    textAlignVertical: 'top',
-    fontSize: 14,
-  },
-  identitySubmit: {
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    height: 46,
-    marginTop: 4,
-  },
-  identitySubmitLabel: {
-    color: '#F8FAFC',
-    fontSize: 14,
-  },
-  header: { paddingHorizontal: 6, paddingBottom: 8 },
-  brand: { fontSize: 36, color: '#111827' },
-  sub: { fontSize: 13, color: '#334155' },
-  userWrap: {
-    marginTop: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  userName: {
-    flex: 1,
-    fontSize: 12,
-    color: '#1E293B',
-  },
-  logoutBtn: {
-    width: 30,
-    height: 30,
-    borderRadius: 999,
-    backgroundColor: '#FEE2E2',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  metricRow: { marginTop: 10, flexDirection: 'row', gap: 8 },
-  metric: {
-    flex: 1,
-    backgroundColor: 'rgba(255,255,255,0.8)',
-    borderRadius: 12,
-    padding: 8,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-  },
-  metricLabel: { fontSize: 12, color: '#64748B' },
-  metricValue: { fontSize: 13, color: '#0F172A', marginTop: 2 },
-  panel: {
-    flex: 1,
-    borderRadius: 22,
-    backgroundColor: 'rgba(255,255,255,0.82)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.8)',
-    padding: 10,
-  },
-  flex: { flex: 1 },
-  hero: { borderRadius: 16, padding: 12, marginBottom: 8 },
-  heroText: { color: '#F8FAFC', fontSize: 15, lineHeight: 21 },
-  chatList: { gap: 8, paddingBottom: 10 },
-  msgRow: { flexDirection: 'row' },
-  left: { justifyContent: 'flex-start' },
-  right: { justifyContent: 'flex-end' },
-  msgBubble: { maxWidth: '86%', borderRadius: 14, paddingHorizontal: 10, paddingVertical: 8 },
-  assistant: {
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    borderTopLeftRadius: 6,
-  },
-  user: { backgroundColor: '#0F766E', borderTopRightRadius: 6 },
-  msgImage: { width: 168, height: 168, borderRadius: 8, marginBottom: 8 },
-  msgText: { fontSize: 14, lineHeight: 20 },
-  dark: { color: '#0F172A' },
-  light: { color: '#F8FAFC' },
-  msgTime: { marginTop: 6, fontSize: 10 },
-  darkSoft: { color: '#94A3B8' },
-  lightSoft: { color: '#D1FAE5' },
-  composer: {
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: 'rgba(15,23,42,0.06)',
-    padding: 8,
-    gap: 8,
-  },
-  previewBox: {
-    width: 80,
-    height: 80,
-    borderRadius: 10,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#CBD5E1',
-  },
-  previewImg: { width: '100%', height: '100%' },
-  previewClose: { position: 'absolute', top: 2, right: 2 },
-  input: { minHeight: 42, maxHeight: 120, fontSize: 14, color: '#0F172A' },
-  actions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
-  mediaBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 10,
-    backgroundColor: '#E2E8F0',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sendBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 10,
-    backgroundColor: '#0F766E',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sendBusy: { opacity: 0.72 },
-  hint: { marginTop: 4, fontSize: 11, color: '#64748B' },
-  notice: { marginTop: 2, fontSize: 11, color: '#B91C1C' },
-  card: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    padding: 12,
-  },
-  title: { fontSize: 20, color: '#0F172A' },
-  moodRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginVertical: 10 },
-  mood: {
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#CBD5E1',
-    backgroundColor: '#F8FAFC',
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-  },
-  moodActive: { backgroundColor: '#0F766E', borderColor: '#0F766E' },
-  moodText: { fontSize: 12, color: '#0F172A' },
-  moodTextActive: { color: '#ECFEFF' },
-  taskBlock: {
-    marginBottom: 12,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    backgroundColor: '#F8FAFC',
-    padding: 10,
-  },
-  taskTitle: {
-    fontSize: 14,
-    color: '#0F172A',
-    marginBottom: 6,
-  },
-  taskRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 5,
-  },
-  taskText: {
-    flex: 1,
-    fontSize: 13,
-    color: '#0F172A',
-  },
-  taskTextDone: {
-    color: '#64748B',
-    textDecorationLine: 'line-through',
-  },
-  addTaskCenterBtn: {
-    alignSelf: 'center',
-    width: 52,
-    height: 52,
-    borderRadius: 999,
-    marginTop: 6,
-    backgroundColor: '#0F766E',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#0F172A',
-    shadowOpacity: 0.22,
-    shadowRadius: 8,
+  authError: { color: '#E17055', fontSize: 12, marginLeft: 2 },
+  // 强调色按钮
+  authSubmit: { 
+    borderRadius: 16, 
+    alignItems: 'center', 
+    justifyContent: 'center', 
+    height: 54, 
+    backgroundColor: '#0A0A0A',
+    shadowColor: '#FF6B35',
+    shadowOpacity: 0.35,
+    shadowRadius: 12,
     shadowOffset: { width: 0, height: 4 },
+    elevation: 3,
+  },
+  authSubmitLabel: { color: '#FFFFFF', fontSize: 16, letterSpacing: 0.5, fontWeight: '600' },
+  authHint: { fontSize: 12, color: '#A3A3A3', lineHeight: 18, textAlign: 'center' },
+
+  identityRoot: { flex: 1, backgroundColor: '#FFFFFF' },
+  identitySafe: { flex: 1, paddingHorizontal: 24 },
+  identityScrollContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingTop: 12,
+    paddingBottom: 24,
+  },
+  identityContentWrap: {
+    width: '100%',
+  },
+  // 品牌标识
+  identityLogoWrap: { alignItems: 'center', marginBottom: 20 },
+  identityLogo: { 
+    width: 64, 
+    height: 64, 
+    borderRadius: 32, 
+    backgroundColor: '#FFFFFF', 
+    alignItems: 'center', 
+    justifyContent: 'center',
+    marginBottom: 14,
+    shadowColor: '#FF6B35',
+    shadowOpacity: 0.4,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 3,
+    borderWidth: 2,
+    borderColor: '#FF6B35',
+  },
+  identityBrand: { fontSize: 36, color: '#0A0A0A', textAlign: 'center', marginBottom: 6, fontWeight: '700' },
+  identitySub: { fontSize: 14, color: '#525252', textAlign: 'center', marginBottom: 24 },
+  // 玻璃卡片
+  identityCard: {
+    borderRadius: 28,
+    borderWidth: 1,
+    borderColor: '#E5E5E5',
+    backgroundColor: '#FFFFFF',
+    padding: 20,
+    gap: 12,
+    shadowColor: '#0A0A0A',
+    shadowOpacity: 0.08,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 8 },
     elevation: 4,
   },
-  taskEditorCard: {
-    marginBottom: 12,
+  identityTitle: { fontSize: 15, color: '#0A0A0A', marginTop: 4, marginBottom: 8, fontWeight: '600' },
+  identityHint: { fontSize: 12, color: '#A3A3A3', lineHeight: 18 },
+  identityOptionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 6,
+  },
+  identityOptionChip: {
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#BFDBFE',
-    backgroundColor: '#FFFFFF',
-    padding: 10,
-  },
-  taskImageActions: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 10,
-    marginBottom: 8,
-  },
-  taskIconBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#CBD5E1',
-    backgroundColor: '#F8FAFC',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  taskPreviewImage: {
-    width: '100%',
-    height: 150,
-    borderRadius: 10,
-    marginBottom: 8,
-  },
-  taskAnalyzingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    marginBottom: 8,
-  },
-  taskAnalyzingText: {
-    fontSize: 12,
-    color: '#0F766E',
-  },
-  taskInput: {
-    height: 46,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    backgroundColor: '#F8FAFC',
-    paddingHorizontal: 10,
-    color: '#0F172A',
-    marginBottom: 10,
-  },
-  taskSaveBtn: {
-    alignSelf: 'center',
-    width: '76%',
-    height: 46,
-    borderRadius: 999,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  taskSaveText: {
-    fontSize: 15,
-    color: '#F8FAFC',
-  },
-  field: { marginBottom: 10 },
-  fieldLabel: { marginBottom: 5, fontSize: 13, color: '#0F172A' },
-  fieldInput: {
-    minHeight: 74,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    backgroundColor: '#F8FAFC',
-    paddingHorizontal: 10,
-    paddingVertical: 9,
-    textAlignVertical: 'top',
-  },
-  save: { borderRadius: 12, paddingVertical: 11, alignItems: 'center' },
-  saveText: { fontSize: 14, color: '#F8FAFC' },
-  fact: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    padding: 10,
-    marginTop: 8,
-  },
-  factTag: { fontSize: 12 },
-  factText: { marginTop: 4, fontSize: 13, color: '#0F172A', lineHeight: 18 },
-  taskBoardCard: {
-    marginTop: 8,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#C7D2FE',
-    backgroundColor: '#EEF2FF',
-    padding: 10,
-  },
-  taskBoardTitle: {
-    fontSize: 15,
-    color: '#111827',
-  },
-  taskBoardGrid: {
-    marginTop: 8,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  taskBoardMetric: {
-    width: '48%',
-    borderRadius: 12,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#BFDBFE',
-    paddingVertical: 8,
-    paddingHorizontal: 8,
-  },
-  taskBoardMetricValue: {
-    fontSize: 18,
-    color: '#0F172A',
-  },
-  taskBoardMetricLabel: {
-    fontSize: 11,
-    color: '#64748B',
-    marginTop: 2,
-  },
-  taskBoardCheer: {
-    marginTop: 10,
-    fontSize: 12,
-    color: '#0F766E',
-  },
-  taskBoardLine: {
-    marginTop: 5,
-    fontSize: 12,
-    color: '#334155',
-    lineHeight: 18,
-  },
-  taskBoardAiWrap: {
-    marginTop: 10,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#A7F3D0',
-    backgroundColor: '#ECFDF5',
-    padding: 8,
-    gap: 4,
-  },
-  taskBoardAiTitle: {
-    fontSize: 12,
-    color: '#065F46',
-  },
-  taskBoardAiText: {
-    fontSize: 12,
-    color: '#134E4A',
-    lineHeight: 18,
-  },
-  recapFilters: {
-    marginTop: 8,
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 8,
-  },
-  recapFilterBtn: {
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#BFDBFE',
-    backgroundColor: '#F8FAFC',
+    borderColor: '#D4D4D4',
+    backgroundColor: '#FAFAFA',
     paddingHorizontal: 12,
     paddingVertical: 6,
   },
-  recapFilterBtnActive: {
-    backgroundColor: '#0F766E',
-    borderColor: '#0F766E',
+  identityOptionChipActive: {
+    borderColor: '#FF6B35',
+    backgroundColor: '#FFF4EF',
   },
-  recapFilterLabel: {
-    fontSize: 12,
-    color: '#0F172A',
-  },
-  recapFilterLabelActive: {
-    color: '#F8FAFC',
-  },
-  recapCard: {
-    marginTop: 10,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#BFDBFE',
-    backgroundColor: '#FFFFFF',
-    overflow: 'hidden',
-  },
-  recapHead: {
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-  },
-  recapLabel: {
-    fontSize: 14,
-    color: '#0F172A',
-  },
-  recapMeta: {
-    fontSize: 11,
-    color: '#334155',
-    marginTop: 2,
-  },
-  recapSummary: {
-    marginTop: 8,
-    marginHorizontal: 10,
+  identityOptionChipText: {
     fontSize: 13,
-    color: '#0F172A',
-    lineHeight: 19,
+    color: '#525252',
   },
-  recapSection: {
-    marginTop: 8,
-    marginHorizontal: 10,
-    marginBottom: 2,
+  identityOptionChipTextActive: {
+    color: '#FF6B35',
+    fontWeight: '700',
   },
-  recapSectionTitle: {
-    fontSize: 12,
-    color: '#475569',
-  },
-  recapItem: {
-    fontSize: 12,
-    color: '#0F172A',
-    marginTop: 3,
-    lineHeight: 18,
-  },
-  tabs: {
-    marginTop: 8,
-    borderRadius: 14,
+  // 伙伴对话气泡 - 橙色系
+  identityBubble: {
+    borderRadius: 16,
     borderWidth: 1,
-    borderColor: 'rgba(15,23,42,0.08)',
-    padding: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 16,
+  },
+  identityBubbleText: { fontSize: 14, lineHeight: 20, color: '#0A0A0A' },
+  // 输入框
+  identityBioInput: {
+    minHeight: 100,
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: '#E5E5E5',
+    backgroundColor: '#FAFAFA',
+    color: '#0A0A0A',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    textAlignVertical: 'top',
+    fontSize: 14,
+  },
+  // 强调色按钮
+  identitySubmit: { 
+    borderRadius: 16, 
+    alignItems: 'center', 
+    justifyContent: 'center', 
+    height: 50, 
+    marginTop: 6,
+    backgroundColor: '#0A0A0A',
+    shadowColor: '#FF6B35',
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 3,
+  },
+  identitySubmitLabel: { color: '#FFFFFF', fontSize: 15, letterSpacing: 0.5, fontWeight: '600' },
+  identityBackBtn: {
     flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    alignSelf: 'flex-start',
+    marginBottom: 6,
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  identityBackLabel: { fontSize: 12, color: '#0A0A0A' },
+  identitySecondaryAction: {
+    marginTop: 2,
+    marginBottom: 2,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E5E5E5',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 42,
+    backgroundColor: '#FAFAFA',
+  },
+  identitySecondaryActionLabel: { fontSize: 13, color: '#525252' },
+
+  flex: { flex: 1 },
+  homeScreen: {
+    flex: 1,
+  },
+  homeTopNav: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 20,
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderRadius: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    gap: 6,
+    marginBottom: 12,
+  },
+  homeNavItem: {
+    flex: 1,
+    minHeight: 48,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E5E5E5',
+    backgroundColor: '#FFFFFF',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
     gap: 6,
   },
-  tab: {
+  homeNavLabel: { fontSize: 14, fontWeight: '600' },
+  homeCenter: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 74,
+  },
+  homeTitle: { fontSize: 24, lineHeight: 32, textAlign: 'center', marginBottom: 8 },
+  homeDesc: { fontSize: 14, lineHeight: 22, textAlign: 'center' },
+  chatTopBar: {
+    minHeight: 44,
+    justifyContent: 'center',
+    alignItems: 'flex-end',
+    paddingHorizontal: 6,
+    marginBottom: 6,
+  },
+  chatTopSimple: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  chatTopTitle: { fontSize: 18, fontWeight: '700' },
+  chatTopCopyBtn: {
+    minWidth: 72,
+    height: 32,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#FF6B35',
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  chatTopDangerBtn: {
+    borderColor: '#FCA5A5',
+  },
+  chatTopCopyText: { fontSize: 12, fontWeight: '700' },
+  chatSelectionBar: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  chatSelectionCount: {
+    fontSize: 14,
+  },
+  chatSelectionActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  chatSelectionBtn: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#D4D4D4',
+    backgroundColor: '#FAFAFA',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    minWidth: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chatSelectionBtnText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  chatTopRight: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  chatStage: { flex: 1, position: 'relative' },
+  chatList: { gap: 8, paddingTop: 2, paddingHorizontal: 4 },
+  emptyChatState: { alignItems: 'center', paddingVertical: 40, paddingHorizontal: 20 },
+  emptyChatIcon: { 
+    width: 72, 
+    height: 72, 
+    borderRadius: 36, 
+    backgroundColor: '#FFFFFF', 
+    alignItems: 'center', 
+    justifyContent: 'center',
+    marginBottom: 16,
+    borderWidth: 2,
+    borderColor: '#FF6B35',
+  },
+  emptyChatTitle: { fontSize: 18, color: '#0A0A0A', marginBottom: 8, textAlign: 'center', fontWeight: '600' },
+  emptyChatDesc: { fontSize: 14, color: '#525252', textAlign: 'center', lineHeight: 21 },
+  msgRow: { flexDirection: 'row' },
+  msgRowWithAvatar: { flexDirection: 'row', alignItems: 'flex-end', gap: 8 },
+  msgSelectMark: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 1.2,
+    borderColor: '#C4C4C4',
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  msgSelectMarkActive: {
+    borderColor: '#FF6B35',
+    backgroundColor: '#FFF4EF',
+  },
+  msgSelectMarkDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#FF6B35',
+  },
+  msgBubbleSelectedWrap: {
+    borderWidth: 1.2,
+    borderColor: '#FF6B35',
+    borderRadius: 21,
+  },
+  left: { justifyContent: 'flex-start' },
+  right: { justifyContent: 'flex-end' },
+  // 头像样式
+  avatarContainer: {
+    marginBottom: 4,
+  },
+  aiAvatar: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#0A0A0A',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: '#0A0A0A',
+  },
+  avatarRobotIcon: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarRobotHead: {
+    flexDirection: 'row',
+    gap: 4,
+    marginBottom: 2,
+  },
+  avatarRobotEye: {
+    width: 5,
+    height: 5,
+    borderRadius: 1,
+    backgroundColor: '#FF6B35',
+  },
+  avatarRobotMouth: {
+    width: 10,
+    height: 2,
+    borderRadius: 0.5,
+    backgroundColor: '#FF6B35',
+  },
+  userAvatarImage: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#E5E5E5',
+  },
+  defaultUserAvatar: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.2,
+    borderColor: '#FF6B35',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  msgBubble: { maxWidth: '80%', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 10 },
+  // AI气泡 - 暖灰渐变感
+  aiBubble: {
+    backgroundColor: '#2D3436',
+    borderTopLeftRadius: 8,
+    shadowColor: '#2D3436',
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+  // 用户气泡 - 白色带微妙阴影
+  userBubble: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E8E8E8',
+    borderTopRightRadius: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
+  },
+  msgImage: { width: 168, height: 168, borderRadius: 14, marginBottom: 8 },
+  msgQuoteBlock: {
+    borderRadius: 12,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 8,
+  },
+  msgQuoteBlockAi: {
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderColor: 'rgba(255,255,255,0.22)',
+  },
+  msgQuoteBlockUser: {
+    backgroundColor: '#FFF4EF',
+    borderColor: '#FFD7C6',
+  },
+  msgQuoteLabel: {
+    fontSize: 11,
+    marginBottom: 2,
+  },
+  msgQuoteLabelAi: { color: '#FFD7C6' },
+  msgQuoteLabelUser: { color: '#FF6B35' },
+  msgQuoteText: {
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  msgQuoteTextAi: { color: '#F9FAFB' },
+  msgQuoteTextUser: { color: '#525252' },
+  msgText: { fontSize: 15, lineHeight: 22 },
+  msgTime: { marginTop: 6, fontSize: 11 },
+  aiText: { color: '#FFFFFF' },
+  userText: { color: '#2D3436' },
+  aiTime: { color: '#B2BEC3' },
+  userTime: { color: '#B2BEC3' },
+
+  // 输入区域：底部常驻 + 键盘弹层
+  composerDockClosed: {
+    position: 'absolute',
+    left: 2,
+    right: 2,
+    bottom: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#E8E8E8',
+    padding: 10,
+    shadowColor: '#0A0A0A',
+    shadowOpacity: 0.12,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 5,
+  },
+  composerDockRaised: {
+    bottom: 42,
+  },
+  quoteDraftBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#FFD7C6',
+    backgroundColor: '#FFF4EF',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 8,
+    gap: 8,
+  },
+  quoteDraftTextWrap: { flex: 1, gap: 2 },
+  quoteDraftLabel: { fontSize: 12, fontWeight: '700' },
+  quoteDraftText: { fontSize: 12, lineHeight: 16 },
+  quoteDraftCloseBtn: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#FFB899',
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  quoteDraftCloseText: { fontSize: 11, color: '#FF6B35', fontWeight: '700' },
+  input: {
+    flex: 1,
+    minHeight: 42,
+    maxHeight: 42,
+    borderWidth: 1.5,
+    color: '#2D3436',
+    fontSize: 15,
+    lineHeight: 21,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    textAlignVertical: 'center',
+    includeFontPadding: false,
+  },
+  iconBlack: { 
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#FFFFFF', 
+    borderWidth: 1.2,
+    borderColor: '#FF6B35',
+    alignItems: 'center', 
+    justifyContent: 'center',
+    shadowColor: '#FF6B35',
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+  iconSoft: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.1,
+    borderColor: '#FF6B35',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  iconPressed: { transform: [{ scale: 0.92 }], opacity: 0.8 },
+  iconDisabled: { backgroundColor: '#F3F4F6', borderColor: '#D4D4D8' },
+  opacityWeak: { opacity: 0.7 },
+  notice: { marginTop: 8, fontSize: 12, color: '#FF6B35', textAlign: 'center', backgroundColor: '#FFF4EF', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8 },
+  profileContainer: { paddingHorizontal: 16, paddingBottom: 20, gap: 12 },
+  profileCard: {
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#E5E5E5',
+    backgroundColor: '#FFFFFF',
+    padding: 16,
+    shadowColor: '#000',
+    shadowOpacity: 0.04,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 1,
+  },
+  profileAvatarWrap: {
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    alignSelf: 'center',
+    marginBottom: 10,
+  },
+  profileAvatarImage: {
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    backgroundColor: '#E5E5E5',
+  },
+  profileAvatarPlaceholder: {
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 2,
+    borderColor: '#FF6B35',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileAvatarBadge: {
+    position: 'absolute',
+    right: 2,
+    bottom: 2,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: '#FF6B35',
+  },
+  profileName: { fontSize: 18, textAlign: 'center', marginBottom: 4, fontWeight: '600' },
+  profileEmail: { fontSize: 12, textAlign: 'center', marginBottom: 10 },
+  profilePrimaryAction: {
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 40,
+  },
+  profilePrimaryActionLabel: { color: '#FFFFFF', fontSize: 14, fontWeight: '600' },
+  profileSecondaryAction: {
+    marginTop: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 40,
+  },
+  profileSecondaryActionLabel: { fontSize: 14, fontWeight: '500' },
+  profileRow: {
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F5F5F5',
+  },
+  profileRowLabel: { fontSize: 12, marginBottom: 4 },
+  profileRowValue: { fontSize: 14, lineHeight: 20 },
+  profileActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 10,
+  },
+  profileActionIcon: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#FF6B35',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileActionLabel: { fontSize: 14 },
+  recapTopBar: {
+    minHeight: 44,
+    paddingHorizontal: 8,
+    marginBottom: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#FFFFFF',
+    borderBottomWidth: 1,
+    borderBottomColor: '#E5E5E5',
+  },
+  recapTopTitle: { fontSize: 17, color: '#0A0A0A', fontWeight: '600' },
+  recapTopSpacer: { width: 30, height: 30 },
+
+  recapContainer: { paddingBottom: 20, paddingHorizontal: 16 },
+  recapFilters: { 
+    flexDirection: 'row', 
+    gap: 8, 
+    marginBottom: 16, 
+    backgroundColor: '#F5F5F5',
+    padding: 4,
+    borderRadius: 12,
+  },
+  recapFilterBtn: {
     flex: 1,
     borderRadius: 10,
-    flexDirection: 'row',
-    justifyContent: 'center',
+    paddingVertical: 10,
     alignItems: 'center',
-    gap: 5,
-    paddingVertical: 8,
   },
-  tabActive: { backgroundColor: '#0F766E' },
-  tabLabel: { fontSize: 12 },
+  recapFilterBtnActive: { 
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#FF6B35',
+    shadowOpacity: 0.2,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+  recapFilterGradient: {
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+  },
+  recapFilterLabel: { fontSize: 13, color: '#525252', fontWeight: '500' },
+  recapFilterLabelActive: { color: '#FFFFFF', fontWeight: '600', fontSize: 13 },
+  emptyText: { marginTop: 40, color: '#A3A3A3', fontSize: 14, textAlign: 'center' },
+  // 复盘卡片 - 日记风格
+  recapCard: {
+    marginTop: 0,
+    marginBottom: 16,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#E5E5E5',
+    backgroundColor: '#FFFFFF',
+    overflow: 'hidden',
+    shadowColor: '#0A0A0A',
+    shadowOpacity: 0.06,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2,
+  },
+  // 卡片头部 - 带日期
+  recapHead: { 
+    backgroundColor: '#FAFAFA', 
+    borderBottomWidth: 1, 
+    borderBottomColor: '#E5E5E5', 
+    paddingHorizontal: 16, 
+    paddingVertical: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  recapLabel: { fontSize: 16, color: '#0A0A0A', fontWeight: '600' },
+  recapMeta: { fontSize: 12, color: '#A3A3A3' },
+  // 卡片内容区
+  recapSection: { marginTop: 14, marginHorizontal: 16, marginBottom: 8 },
+  recapSectionTitle: { 
+    fontSize: 12, 
+    color: '#FF6B35', 
+    fontWeight: '600',
+    marginBottom: 8,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  recapItem: { 
+    fontSize: 14, 
+    color: '#0A0A0A', 
+    marginTop: 6, 
+    lineHeight: 20,
+    paddingLeft: 4,
+  },
 });
-
-
 

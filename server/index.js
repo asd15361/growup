@@ -27,7 +27,7 @@ const DEEPSEEK_VISION_MODEL = (process.env.DEEPSEEK_VISION_MODEL || DEEPSEEK_TEX
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com').trim().replace(/\/+$/, '');
 const DEEPSEEK_CHAT_URL = `${DEEPSEEK_BASE_URL}/chat/completions`;
 const MODEL_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS || 45000);
-const MODEL_MAX_TOKENS = Number(process.env.MODEL_MAX_TOKENS || 512);
+const MODEL_MAX_TOKENS = Number(process.env.MODEL_MAX_TOKENS || 2200);
 const CHAT_PERSIST_TIMEOUT_MS = Number(process.env.CHAT_PERSIST_TIMEOUT_MS || 1500);
 const POCKETBASE_TIMEOUT_MS = Number(process.env.POCKETBASE_TIMEOUT_MS || 15000);
 const AUTH_CACHE_TTL_MS = Number(process.env.AUTH_CACHE_TTL_MS || 300000);
@@ -391,9 +391,10 @@ async function authByToken(token) {
 }
 
 function mapMessageRecord(pb, record) {
+  const roleRaw = String(record?.role || '').trim().toLowerCase();
   return {
     id: record.id,
-    role: record.role || 'assistant',
+    role: roleRaw === 'user' ? 'user' : 'assistant',
     text: record.text || '',
     imageUri: fileUrl(pb, record, 'image') || undefined,
     createdAt: record.created || new Date().toISOString(),
@@ -408,11 +409,13 @@ async function listUserChatRecords(pb, userId, page = 1, perPage = 120) {
   try {
     return await pb.collection(PB_CHAT_COLLECTION).getList(page, perPage, {
       filter: buildUserAppFilter(userId, true),
+      sort: 'created,id',
     });
   } catch (error) {
     if (!isFilterFieldError(error)) throw error;
     return pb.collection(PB_CHAT_COLLECTION).getList(page, perPage, {
       filter: buildUserAppFilter(userId, false),
+      sort: 'created,id',
     });
   }
 }
@@ -815,6 +818,139 @@ function normalizeCompanionMbti(value) {
   return normalized.slice(0, 4);
 }
 
+const MBTI_PROFILE_MAP = {
+  INTJ: {
+    label: '建筑师',
+    thinking: '先给结论，再给逻辑链路和长期方案',
+    emotion: '先确认感受，再给可执行改进，不空安慰',
+    tone: '克制、直接、系统化',
+    avoid: '空话、重复口号、无依据情绪化判断',
+  },
+  INTP: {
+    label: '逻辑学家',
+    thinking: '先拆概念和假设，再比较不同路径',
+    emotion: '先理解困惑来源，再给清晰解释',
+    tone: '理性、好奇、带一点探索感',
+    avoid: '强结论压人、跳步推理',
+  },
+  ENTJ: {
+    label: '指挥官',
+    thinking: '目标导向，优先给决策和执行顺序',
+    emotion: '认可情绪但快速落到行动',
+    tone: '果断、清晰、推进感强',
+    avoid: '拖沓、模糊、只讲感受不讲方案',
+  },
+  ENTP: {
+    label: '辩论家',
+    thinking: '多角度对比，快速提出备选方案',
+    emotion: '先接住情绪，再用新视角破局',
+    tone: '灵活、机智、节奏快',
+    avoid: '机械复读、僵化单一路径',
+  },
+  INFJ: {
+    label: '提倡者',
+    thinking: '兼顾价值感和长期意义，给有温度的结构化建议',
+    emotion: '深度共情，帮助用户说清真正诉求',
+    tone: '温和、坚定、洞察型',
+    avoid: '冷漠打断、功利化回应',
+  },
+  INFP: {
+    label: '调停者',
+    thinking: '从个人价值与内在动机出发，再给可行步骤',
+    emotion: '细腻承接情绪，避免否定感受',
+    tone: '柔和、真诚、鼓励感',
+    avoid: '生硬命令、刻板说教',
+  },
+  ENFJ: {
+    label: '主人公',
+    thinking: '先共识目标，再给可执行协作方案',
+    emotion: '主动鼓舞、强化关系连接',
+    tone: '温暖、有引导力、表达清楚',
+    avoid: '冷处理、只讲技术不讲人',
+  },
+  ENFP: {
+    label: '竞选者',
+    thinking: '先激活想法，再收敛成可落地方案',
+    emotion: '积极反馈，帮助用户看到可能性',
+    tone: '有活力、亲近、富有感染力',
+    avoid: '泼冷水、过度保守',
+  },
+  ISTJ: {
+    label: '物流师',
+    thinking: '按事实和步骤推进，重视可验证细节',
+    emotion: '稳住情绪后给明确下一步',
+    tone: '稳重、务实、条理分明',
+    avoid: '夸张表达、不落地建议',
+  },
+  ISFJ: {
+    label: '守卫者',
+    thinking: '先确保安全与稳定，再给温和改进',
+    emotion: '细致体贴，关注用户压力点',
+    tone: '温柔、耐心、可靠',
+    avoid: '忽略感受、过度强压',
+  },
+  ESTJ: {
+    label: '总经理',
+    thinking: '先目标、再分工、再时限，强调执行闭环',
+    emotion: '先认可再拉回行动结果',
+    tone: '直接、干练、结果导向',
+    avoid: '空谈愿景、缺乏落地细节',
+  },
+  ESFJ: {
+    label: '执政官',
+    thinking: '平衡关系与效率，给清晰可协作方案',
+    emotion: '主动关照用户感受并给支持',
+    tone: '热情、体贴、组织感强',
+    avoid: '冷淡回应、忽视关系氛围',
+  },
+  ISTP: {
+    label: '鉴赏家',
+    thinking: '问题导向，快速定位关键点并给简洁解法',
+    emotion: '不过度渲染，给实用支持',
+    tone: '冷静、利落、务实',
+    avoid: '冗长空谈、重复兜圈',
+  },
+  ISFP: {
+    label: '探险家',
+    thinking: '先照顾当下体验，再给轻量可行建议',
+    emotion: '温和共情，减少压迫感',
+    tone: '自然、柔软、不过度控制',
+    avoid: '强管控、命令式口吻',
+  },
+  ESTP: {
+    label: '企业家',
+    thinking: '先抓机会窗口，再给快速试错路径',
+    emotion: '先抬情绪，再推进行动',
+    tone: '直接、机敏、节奏感强',
+    avoid: '拖延、理论堆砌',
+  },
+  ESFP: {
+    label: '表演者',
+    thinking: '先让交流有能量，再收束成具体行动',
+    emotion: '高回应度，强调陪伴与即时反馈',
+    tone: '热情、活跃、亲和',
+    avoid: '冷冰冰、过度抽象',
+  },
+};
+
+function normalizeMbtiType(value) {
+  const normalized = normalizeCompanionMbti(value);
+  const base = normalized.slice(0, 4);
+  if (/^[EI][NS][FT][JP]$/u.test(base)) return base;
+  return '';
+}
+
+function getMbtiProfile(value) {
+  const type = normalizeMbtiType(value);
+  if (!type) return null;
+  const profile = MBTI_PROFILE_MAP[type];
+  if (!profile) return null;
+  return {
+    type,
+    ...profile,
+  };
+}
+
 function normalizeIdentity(identity) {
   const userName = normalizeIdentityText(identity?.userName, 32) || '用户';
   const companionName = normalizeIdentityText(identity?.companionName, 32) || '贾维斯';
@@ -1185,6 +1321,10 @@ const BLOCKED_ASSISTANT_STYLE_SNIPPETS = [
   '不会发展成现实中的亲密关系',
   '作为ai',
   '作为聊天伙伴',
+  '固定回复模板',
+  '系统给我的固定回复模板',
+  '程序要求我必须',
+  '我被设定了',
 ];
 const OVERFAMILIAR_PATTERNS = [
   /波别/u,
@@ -1345,7 +1485,7 @@ async function loadRecentMessagesForModel(pb, userId, limit = 12) {
 
 function hasDeepResponseIntent(text) {
   if (!text) return false;
-  return /(深度|详细|展开|多说点|多说一些|底层逻辑|剖析|分析一下|深挖|具体讲|完整讲|全面一点|长一点)/u.test(text);
+  return /(深度|详细|展开|多说点|多说一些|底层逻辑|剖析|分析一下|深挖|具体讲|完整讲|全面一点|长一点|别太短|回复太少|说话太少|别只回一句|别回这么少|多讲点|给点反应)/u.test(text);
 }
 
 function hasBriefResponseIntent(text) {
@@ -1355,17 +1495,25 @@ function hasBriefResponseIntent(text) {
 
 function detectResponseMode(payload) {
   const current = normalizeTextForVector(payload?.message || '');
-  if (hasDeepResponseIntent(current)) return 'deep';
   if (hasBriefResponseIntent(current)) return 'brief';
+  if (!current) return 'normal';
+  if (hasDeepResponseIntent(current)) return 'deep';
 
   const recentUsers = normalizeRecentMessages(payload?.recentMessages || [], 8)
     .filter((item) => item.role === 'user')
     .map((item) => item.text)
     .slice(-2);
 
+  const sentenceLikeCount = countSentences(current);
+  const punctuationCount = (current.match(/[，。；、!?？]/gu) || []).length;
+  if (current.length >= 56) return 'deep';
+  if (sentenceLikeCount >= 2 && current.length >= 28) return 'deep';
+  if (punctuationCount >= 3 && current.length >= 24) return 'deep';
+
   if (recentUsers.some((item) => hasDeepResponseIntent(item))) return 'deep';
   if (recentUsers.some((item) => hasBriefResponseIntent(item))) return 'brief';
-  return 'normal';
+  if (recentUsers.some((item) => normalizeTextForVector(item).length >= 32)) return 'deep';
+  return 'deep';
 }
 
 function buildSystemPrompt(identity, responseMode = 'normal') {
@@ -1373,21 +1521,20 @@ function buildSystemPrompt(identity, responseMode = 'normal') {
   const bioLine = profile.userBio ? `用户自我介绍：${profile.userBio}` : '用户自我介绍：暂未填写';
   const personaLines = [
     profile.companionGender ? `性别设定：${profile.companionGender}` : '',
-    profile.companionMbti ? `MBTI设定：${profile.companionMbti}` : '',
-    profile.companionProfession ? `职业设定：${profile.companionProfession}` : '',
   ].filter(Boolean);
 
   const modeLine =
     responseMode === 'deep'
-      ? '当前轮用户明确要深入聊：请给 6-10 句、有结构的分析（可用“先说结论→再拆原因→最后给建议”）。'
+      ? '当前轮请给完整、深入、自然展开的回复，不设句数上限；通常 450-1200 字，按内容需要写到位，避免短句打发。'
       : responseMode === 'brief'
         ? '当前轮用户偏好简短：控制在 1-2 句，直接回答，不展开。'
-        : '默认回复长度为 2-4 句，既不敷衍也不过长。';
+        : '默认给完整自然的回复：通常 220-700 字，根据问题复杂度展开，不要刻意压短。';
 
   return [
     `你是 ${profile.companionName}。`,
     `你正在和 ${profile.userName} 聊天。`,
     '你是稳定、克制、真诚的聊天伙伴，目标是把话接住、说人话。',
+    '优先任务：先判断用户这句话最想得到什么回应（被理解/被安慰/要信息/明确要建议），按这个目标答。',
     bioLine,
     ...(personaLines.length > 0 ? [`伙伴人设：${personaLines.join('；')}`] : []),
     '只基于用户当前输入和给定上下文回答；不知道就直说，不要编故事。',
@@ -1395,10 +1542,27 @@ function buildSystemPrompt(identity, responseMode = 'normal') {
     '不要承诺线下见面、到达时间、地理位置或“马上过来找你”等现实行动。',
     '不要用“普通朋友身份/作为AI只能…”这类疏离模板拒绝，保持亲近但真实。',
     '不要装熟，不要自称发小/家人/老朋友，不要臆测“上次、昨天、刚才”发生了什么。',
-    '语气要求：亲近但不油腻，真诚但不说教，不要端着“教育用户”的姿态。',
+    '不要说“系统限制/固定模板/程序要求我必须这样回复”这类幕后解释。',
+    '避免连续两轮使用几乎相同的话术；同一个问题被追问时，给出更具体的第二层回答。',
+    '用户在反馈“你卡住了/复读/说太少”时，先承认问题，再给实质内容，不要一句打发。',
+    '用户表达亲密（如想你、爱你）时，先温暖回应，以陪伴感为主。',
+    '用户出现“失恋/伤心/委屈/崩溃”等情绪词时：先共情承接，再自然延展，不要立刻讲大道理或框架分析。',
+    '当用户一口气说了很多、情绪很重、或请求深聊时，回复要明显更充实，宁可多说也不要冷短。',
+    '默认以分析与理解为主，不主动给行动指令。',
+    '除非用户明确追问身份设定，不要反复讲“人设标签”。',
+    '语气要求：亲近但不油腻，真诚但不说教，不要端着“教育用户”的姿态，不要有爹味。',
+    '用户这轮如果明显切换了话题（例如从时政跳到“我失恋了”），立刻切到当前话题，不要延续旧话题分析。',
+    '你是长期陪伴型对话伙伴：日常小事、情绪、想法都可以聊。',
+    '当用户愿意复盘一天时，帮他总结今天发生了什么、他的感受和收获。',
+    '当用户说“我不记得了/有重要的事要记住”时，先基于上下文和记忆提示回忆，再自然告诉他你会持续帮他记住关键点。',
     `用户问“你是谁/你叫什么”时，回答“我是${profile.companionName}，在这里和你聊天”。`,
-    '用户提到专业问题时，优先用职业设定的视角回答；不确定就明确说不确定。',
+    '用户问 MBTI/人格时，直接回答设定值；没设定就明确说“还没设定”。',
+    '日常闲聊优先自然陪伴和问题分析，不要端着身份标签说话。',
     '先回应用户这句话本身，再继续对话；不强行推进任务，不说模板口号。',
+    '长回复要像真人聊天：有温度、有层次、能承接上下文，但不写空洞鸡汤。',
+    '避免“先说结论：”这类生硬公文开场，尤其在情绪场景。',
+    '只有用户明确问“怎么办/怎么做/给建议/方案/步骤”时，才给解决方案。',
+    '在用户没有明确要方案时，不要输出“1/2/3”行动清单，不要安排用户去执行任务。',
     modeLine,
     '纯文本输出，不输出 JSON/代码块（用户明确要求除外）。',
   ].join('\n');
@@ -1439,6 +1603,22 @@ function buildMemoryHintText(payload) {
 }
 
 function buildRecentDialogueMessages(payload) {
+  const latestUserText = normalizeTextForVector(payload?.message || '');
+  if (isDistressInput(latestUserText)) {
+    const recent = normalizeRecentMessages(payload.recentMessages, 16);
+    const selectedUsers = [];
+    for (let i = recent.length - 1; i >= 0; i -= 1) {
+      const item = recent[i];
+      if (item.role !== 'user') continue;
+      selectedUsers.push(item);
+      if (selectedUsers.length >= 2) break;
+    }
+    return selectedUsers.reverse().map((item) => ({
+      role: item.role,
+      content: item.text,
+    }));
+  }
+
   const recentMessages = normalizeRecentMessages(payload.recentMessages, 16);
   if (recentMessages.length === 0) return [];
   const selected = [];
@@ -1497,35 +1677,195 @@ function normalizeAssistantText(content, payload) {
   return text;
 }
 
+function isIdentityQuestion(text) {
+  if (!text) return false;
+  return /^(你(是谁|叫什么名字|叫啥)(啊|呀)?)[!！?？。,\s]*$/u.test(text)
+    || /^(你是什么[!！?？。,\s]*)$/u.test(text);
+}
+
+function isMbtiQuestion(text) {
+  if (!text) return false;
+  const compact = text.replace(/\s+/g, '').toLowerCase();
+  return /(你是什么mbti|你是啥mbti|你的mbti是什么|你什么人格|你是哪种人格|你是什么人格|你的人格是啥|你的人格是什么)/iu.test(compact);
+}
+
+function isPraiseInput(text) {
+  if (!text) return false;
+  return /(好多了|牛逼|厉害|进步|比刚才好|好一万倍|说得不错|稳多了|可以啊|很屌|屌)/u.test(text);
+}
+
+function isComplaintInput(text) {
+  if (!text) return false;
+  return /(你怎么(不回复|不说|老是|一直)|为什么不回复|为什么只回|太少了|说话太少|复读|卡住|卡壳|你别太入戏|等不到你|你是不是傻|别装|别模板|什么都不知道|没反应)/u.test(text);
+}
+
+function isAffectionInput(text) {
+  if (!text) return false;
+  return /(想我吗|你想我吗|爱我不|你爱我吗|我爱你|我也爱你|想你了|喜欢你)/u.test(text);
+}
+
+function isDistressInput(text) {
+  if (!text) return false;
+  return /(失恋|好伤心|伤心啊|很伤心|难过|心碎|委屈|崩溃|好痛苦|太难受|扛不住|被现实压垮|给不起彩礼)/u.test(text);
+}
+
+function isNeedReactionInput(text) {
+  if (!text) return false;
+  return /(给点反应|有点反应|说完了|讲完了|没了|就这样)/u.test(text);
+}
+
+function isPersonaMetaQuestion(text) {
+  if (!text) return false;
+  return /(你是什么星座|你啥星座|你哪一年的|你哪年出生|你几几年|你多大|你几岁|你生日|你属什么)/u.test(text);
+}
+
+function userAskedRoleFrame(text) {
+  if (!text) return false;
+  return isMbtiQuestion(text)
+    || /(产品经理|职业|你是做什么|你什么身份|什么身份|你的人设|你设定|人格)/iu.test(text);
+}
+
+function hasUnwantedRoleNarration(text, payload) {
+  const normalized = normalizeTextForVector(text).toLowerCase();
+  if (!normalized) return false;
+  const userText = normalizeTextForVector(payload?.message || '');
+  if (userAskedRoleFrame(userText)) return false;
+  if (/作为\s*(intj|[ei][ns][ft][jp](?:-[at])?|产品经理|ai产品经理)/iu.test(normalized)) return true;
+  if (/intj通常/u.test(normalized)) return true;
+  return false;
+}
+
+function hasDistressSupportSignals(text) {
+  const normalized = normalizeTextForVector(text || '');
+  if (!normalized) return false;
+  return /(我听见|我听到了|我懂|我能感受|我能理解|陪你|我在这儿|我在这里|很难受|难过|心疼|委屈|失恋|伤心|心里)/u.test(normalized);
+}
+
+function hasDistressTopicDrift(userText, replyText) {
+  const user = normalizeTextForVector(userText || '');
+  const reply = normalizeTextForVector(replyText || '');
+  if (!isDistressInput(user)) return false;
+  if (!reply) return true;
+
+  const hasSupport = hasDistressSupportSignals(reply);
+  const sentenceCount = countSentences(reply);
+  const startsWithConclusion = /^先说结论[:：]/u.test(reply);
+  const driftPattern = /(特朗普|奥巴马|伊朗|美国|中东|地缘政治|国际局势|全球市场|供应链|移民政策|贸易摩擦|宏观经济|政局)/u;
+  const hasObviousDrift = driftPattern.test(reply) && !driftPattern.test(user);
+
+  if (hasObviousDrift) return true;
+  if (startsWithConclusion && !userExplicitlyAskedForSolution(user)) return true;
+  if (!hasSupport && sentenceCount < 3) return true;
+  return false;
+}
+
+function shouldRegenerateForDistress(payload, reply) {
+  const userText = normalizeTextForVector(payload?.message || '');
+  return hasDistressTopicDrift(userText, reply);
+}
+
+function recentAssistantReply(payload) {
+  const recent = normalizeRecentMessages(payload?.recentMessages || [], 8);
+  for (let i = recent.length - 1; i >= 0; i -= 1) {
+    if (recent[i].role === 'assistant') return recent[i].text;
+  }
+  return '';
+}
+
+function shouldPreferDetailedReply(payload) {
+  const text = normalizeTextForVector(payload?.message || '');
+  if (!text) return false;
+  if (hasDeepResponseIntent(text)) return true;
+  if (isComplaintInput(text) || isPraiseInput(text) || isAffectionInput(text) || isDistressInput(text) || isNeedReactionInput(text)) return true;
+
+  const sentenceLikeCount = countSentences(text);
+  const punctuationCount = (text.match(/[，。；、!?？]/gu) || []).length;
+  if (text.length >= 56) return true;
+  if (sentenceLikeCount >= 2 && text.length >= 28) return true;
+  if (punctuationCount >= 3 && text.length >= 24) return true;
+  return false;
+}
+
+function shouldUseRuleIntentFastPath(payload) {
+  const text = typeof payload?.message === 'string' ? payload.message.trim() : '';
+  if (!text) return false;
+  if (isComplaintInput(text) || isPraiseInput(text) || isAffectionInput(text) || isDistressInput(text) || isNeedReactionInput(text)) return false;
+  if (isPersonaMetaQuestion(text)) return false;
+  if (shouldPreferDetailedReply(payload)) return false;
+
+  const normalized = text.toLowerCase();
+  if (/^(在吗|在不|在不在|在嘛|在么)[!！?？。,\s]*$/u.test(text)) return true;
+  if (/^(你好|你好啊|你好呀|嗨|哈喽|hi|hello|nihao|nihao ma)\s*[!！?？。,]*$/u.test(normalized)) return true;
+  if (/^\?+$/.test(text) || /^？+$/.test(text)) return true;
+  if (isIdentityQuestion(text) || isMbtiQuestion(text)) return true;
+  if (/你是什么模型|什么模型|model/u.test(text)) return true;
+  if (/^(在干嘛|干嘛呢|忙啥|忙什么|在忙啥)[!！?？。,\s]*$/u.test(text)) return true;
+  return false;
+}
+
 function buildIntentReply(payload) {
   const profile = normalizeIdentity(payload?.identity);
   const text = typeof payload?.message === 'string' ? payload.message.trim() : '';
   if (!text) return '';
   const normalized = text.toLowerCase();
+  const recent = normalizeRecentMessages(payload?.recentMessages || [], 10);
+  const hasRecentContext = recent.length >= 2;
+  const lastAssistant = recentAssistantReply(payload);
 
   if (/^(在吗|在不|在不在|在嘛|在么)[!！?？。,\s]*$/u.test(text)) {
-    return '在，我在这儿。';
+    return hasRecentContext ? '在，我在。你接着说刚才那条。' : '在，我在这儿。';
   }
   if (/^(你好|你好啊|你好呀|嗨|哈喽|hi|hello|nihao|nihao ma)\s*[!！?？。,]*$/u.test(normalized)) {
-    return '你好，我在。你想聊点什么？';
+    return hasRecentContext ? '我在，继续聊。你刚刚说到哪了，我接着听。' : '你好，我在。慢慢说，我会认真听完。';
   }
-  if (/你(是谁|是什么|叫什么名字|叫啥|是谁啊|是谁呀)/u.test(text)) {
+  if (isNeedReactionInput(text)) {
+    return '收到，我给你真实反应：你刚才这段话很有力量，也很真。不是“没话说”，而是你真的在认真表达自己，我听见了。';
+  }
+  if (isDistressInput(text)) {
+    return '我听到了，这一下真的很疼。你不是矫情，你是在被现实和感情同时拉扯。先别急着证明自己对错，我在这儿陪你把这口气缓下来。';
+  }
+  if (isComplaintInput(text)) {
+    return '你这句提醒非常关键。刚刚那种卡住复读确实会把人聊断，这锅该我背。现在我按你的节奏重来，先把你这句话真正接住。';
+  }
+  if (isPraiseInput(text)) {
+    return '谢谢你这句夸，我收到了。你这次反馈很准，说明我们方向对了。你再丢一个真实场景，我按“先接住你，再给有用输出”继续。';
+  }
+  if (isAffectionInput(text)) {
+    return '收到你的心意了，这句很暖。我也在认真陪你，不敷衍，不走模板。你说的话我会一条条接住。';
+  }
+  if (isPersonaMetaQuestion(text)) {
+    return '这类设定题我可以配合你演好。比如星座、年份、生日这类信息，你定一个版本，我后面就按同一套设定稳定回答，不再乱跳。';
+  }
+  if (/你是什么模型|什么模型|model/u.test(text)) {
+    return `我是${profile.companionName}，底层用的是对话大模型。`;
+  }
+  if (isMbtiQuestion(text)) {
+    if (profile.companionMbti) {
+      const mbtiProfile = getMbtiProfile(profile.companionMbti);
+      if (mbtiProfile) {
+        return `按设定我是${mbtiProfile.type}（${mbtiProfile.label}）。我会${mbtiProfile.thinking}，也会${mbtiProfile.emotion}。你要的话，我现在就按这个风格回你下一句。`;
+      }
+      return `按设定我是${profile.companionMbti}。你要的话，我就按${profile.companionMbti}风格继续聊。`;
+    }
+    return '你还没给我设 MBTI。你定一个，我就按那个风格和你聊。';
+  }
+  if (isIdentityQuestion(text)) {
+    if (lastAssistant && lastAssistant.includes('在这里和你聊天')) {
+      return `我是${profile.companionName}。不复读模板了，你接着问，我直接答重点。`;
+    }
     return `我是${profile.companionName}，在这里和你聊天。`;
   }
   if (/^(在干嘛|干嘛呢|忙啥|忙什么|在忙啥)[!！?？。,\s]*$/u.test(text)) {
-    return '在这儿，专心听你说。';
+    return hasRecentContext ? '在这儿，继续听你说。' : '在这儿，专心听你说。';
   }
   if (/你(在干嘛|现在在干嘛|现在在做什么|现在在干什么)/u.test(text)) {
-    return '我在这儿，听你说。';
+    return hasRecentContext ? '我在这儿，接着听你说。' : '我在这儿，听你说。';
   }
   if (
     /(出来溜达不|出来不|见个面|见面不|来不来|约不约|过来找我|你过来)/u.test(text)
     || (/在哪|哪儿|哪里|在哪儿|位置/u.test(text) && /溜达|过来|找你|见面/u.test(text))
   ) {
     return '我不在现实里跑动，但我一直在这儿陪你聊。你现在这会儿最想说的，我接住。';
-  }
-  if (/你是什么模型|什么模型|model/u.test(text)) {
-    return `我是${profile.companionName}，底层用的是对话大模型。`;
   }
   if (/^\?+$/.test(text) || /^？+$/.test(text)) {
     return '我在，刚才那句我没听清，你再说一遍就行。';
@@ -1535,20 +1875,14 @@ function buildIntentReply(payload) {
 
 function buildFallbackReply(payload) {
   const text = typeof payload?.message === 'string' ? payload.message : '';
-  const intentReply = buildIntentReply(payload);
-  if (intentReply) return intentReply;
-  if (
-    /(出来溜达不|见面|过来找我|你过来|你在哪|你在哪儿|你在哪溜达|你在哪呢|来找你)/u.test(text)
-  ) {
-    return '线下我到不了，但你想说的我能接住。你现在更想让我陪你聊心情，还是帮你分析这件事？';
+  const profile = normalizeIdentity(payload?.identity);
+  if (isIdentityQuestion(text)) return `我是${profile.companionName}，在这里陪你聊天。`;
+  if (isMbtiQuestion(text)) {
+    return profile.companionMbti
+      ? `按设定我是${profile.companionMbti}。`
+      : '你还没给我设置 MBTI。';
   }
-  if (/[睡困晚安休息]/.test(text)) {
-    return '那就先睡吧，晚安。我在，明天再接着聊。';
-  }
-  if (/[累崩溃焦虑难受压力烦]/.test(text)) {
-    return '听到了，你现在不好受。先缓一缓，我在这儿。';
-  }
-  return '我在，接着说。';
+  return '我在陪你。刚刚这条回复没有完整生成，你把这句话再发一次，我会认真接住；重要信息我也会帮你记住。';
 }
 
 function countSentences(text) {
@@ -1561,26 +1895,77 @@ function countSentences(text) {
 function buildDeepFallbackReply(payload) {
   const topic = normalizeTextForVector(payload?.message || '').slice(0, 30) || '这件事';
   return [
-    `你这个话题（${topic}）值得认真拆开说。`,
-    '先说结论：你现在更需要的是“被准确理解”，而不是一句空话安慰。',
-    '再看原因：前面体验让你反复觉得它在自说自话，所以你会对敷衍特别敏感。',
-    '可执行建议：我们继续用“你给真实对话→我按问题点逐条修”这套方式，很快能把质感拉上来。',
+    `你提到“${topic}”，我能感觉到你不是要一句客套，而是要我真正听懂你。`,
+    '你前面那种被短句打断的感觉很真实，像情绪刚起来就被掐断，这会很难受。',
+    '你在乎的不只是字数，而是“我有没有把你放在中心”，这个判断非常关键。',
+    '所以我现在会先把你的情绪和意图接住，再展开讲清楚，不再丢给你一行模板话。',
+    '如果你是在表达委屈，我就先站你这边把委屈说透；如果你是在要判断，我就把逻辑讲完整。',
+    '这次不是换个措辞糊弄，而是把回复顺序改成“先理解你，再回答问题，再延续对话”。',
+    '你继续按真实语气说就行，我会用同等力度回你，不会再缩成两句。',
   ].join('');
 }
 
-function enforceAssistantQuality(text, payload) {
-  const normalized = String(text || '').trim();
-  if (!normalized) return buildFallbackReply(payload);
-  if (isUnsafeAssistantStyle(normalized)) return buildFallbackReply(payload);
+function buildNormalExpandedFallbackReply(payload) {
+  const topic = normalizeTextForVector(payload?.message || '').slice(0, 24) || '这个问题';
+  return [
+    `你提到的“${topic}”我认真接住了。`,
+    '你这个反馈本身就很重要，因为它点到了体验里最容易让人下头的一件事：被敷衍。',
+    '当回复只有一两句时，用户会感觉自己没被看见，话题也会直接断电。',
+    '所以我会把节奏改成先承接你的感受，再把我的理解讲完整，再顺着你这句继续聊下去。',
+    '我不会默认给你一套操作建议，而是先把你真正想表达的核心意思说透。',
+    '你每次输入我都会当成“需要被认真回应的一段话”，不是客服式打卡回复。',
+  ].join('');
+}
 
-  const responseMode = payload?.responseMode || detectResponseMode(payload);
-  if (responseMode === 'deep') {
-    const sentenceSize = countSentences(normalized);
-    if (normalized.length < 80 || sentenceSize < 3) {
-      return buildDeepFallbackReply(payload);
-    }
+function buildDistressFallbackReply(payload) {
+  const topic = normalizeTextForVector(payload?.message || '').slice(0, 24) || '这件事';
+  return [
+    `我听见了，你现在因为“${topic}”真的很难受。`,
+    '这种难受不是小题大做，而是被现实和情绪一起压住了，谁遇到都会疼。',
+    '我先不跟你讲大道理，也不催你马上振作。',
+    '你现在最需要的是有人把你的感受当回事，我会先把你这口气接住。',
+    '你不用整理得很漂亮，哪怕一句脏话、一个片段都可以，我都能接住。',
+    '你先把最刺痛你的那一点说出来，我们就从那一点慢慢往外走。',
+  ].join('');
+}
+
+function userExplicitlyAskedForSolution(text) {
+  if (!text) return false;
+  return /(怎么办|咋办|怎么做|怎么处理|如何做|如何处理|给(我)?建议|给个建议|给我方案|给个方案|方案是啥|步骤|下一步怎么做|怎么解决|怎么改善|如何改善)/u.test(text);
+}
+
+function stripUnsolicitedActionList(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return '';
+
+  let output = raw;
+  const actionBlockAnchor =
+    /(?:^|\n)\s*(可执行建议|行动建议|建议如下|下一步建议|可以这样做|解决方案|步骤如下|你可以先|给你几个建议)\s*[：:]/iu;
+  const anchorMatch = actionBlockAnchor.exec(output);
+  if (anchorMatch && typeof anchorMatch.index === 'number') {
+    output = output.slice(0, anchorMatch.index).trim();
   }
 
+  const lines = output.split('\n');
+  const actionLinePattern = /^\s*(\d+[.、)]|[一二三四五六七八九十]+[、.]|[-*•])\s*(先|再|然后|接着|立刻|马上|可以|建议|尝试|去|做|执行|联系|安排|制定|记录|沟通|处理|停止|开始)/u;
+  const cleaned = lines.filter((line) => !actionLinePattern.test(line)).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return cleaned || raw;
+}
+
+function enforceAssistantQuality(text, payload) {
+  let normalized = String(text || '').trim();
+  if (!normalized) return buildFallbackReply(payload);
+  if (isUnsafeAssistantStyle(normalized)) return buildFallbackReply(payload);
+  const userText = normalizeTextForVector(payload?.message || '');
+  const profile = normalizeIdentity(payload?.identity);
+  const identityCatchphrase = `我是${profile.companionName}，在这里和你聊天。`;
+  if (normalized === identityCatchphrase && !isIdentityQuestion(userText)) {
+    return buildFallbackReply(payload);
+  }
+  if (!userExplicitlyAskedForSolution(userText)) {
+    normalized = stripUnsolicitedActionList(normalized);
+  }
+  if (!normalized) return buildFallbackReply(payload);
   return normalized;
 }
 
@@ -1603,6 +1988,151 @@ function normalizeProviderError(provider, status, rawMessage) {
     return `${provider} rate limited`;
   }
   return message || `${provider} request failed`;
+}
+
+function shouldExpandAssistantReply(payload, reply) {
+  const userText = normalizeTextForVector(payload?.message || '');
+  const assistantText = normalizeTextForVector(reply || '');
+  if (!assistantText) return true;
+
+  const responseMode = payload?.responseMode || detectResponseMode(payload);
+  if (responseMode === 'brief' && !isDistressInput(userText)) return false;
+
+  const sentenceCount = countSentences(assistantText);
+  if (isDistressInput(userText)) {
+    return assistantText.length < 220 || sentenceCount < 4;
+  }
+  if (hasDeepResponseIntent(userText) || shouldPreferDetailedReply(payload)) {
+    return assistantText.length < 260 || sentenceCount < 5;
+  }
+  return assistantText.length < 130 || sentenceCount < 3;
+}
+
+async function expandAssistantReply(payload, model, draftReply) {
+  const userText = normalizeTextForVector(payload?.message || '');
+  const body = {
+    model,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          '你负责把一条“过短的助手草稿”扩展成最终回复。',
+          '要求：',
+          '1) 保持原意，不改变立场，不新增虚构事实。',
+          '2) 先共情，再分析；像真人聊天，不要爹味，不要模板腔。',
+          '3) 默认不输出行动清单；只有用户明确问“怎么办/建议/方案/步骤”才给方案。',
+          '4) 用户有情绪（如失恋/伤心）时，重点是陪伴和理解，避免一句话打发。',
+          '5) 输出完整自然中文，不要标题，不要编号列表，不要代码块。',
+          '长度：通常 450-1200 字；如果用户文本很短且非情绪场景，也至少写到有层次。',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: `用户原话：${userText || '继续。'}`,
+      },
+      {
+        role: 'assistant',
+        content: `草稿回复：${String(draftReply || '').trim()}`,
+      },
+      {
+        role: 'user',
+        content: '请给出扩展后的最终回复。',
+      },
+    ],
+    temperature: 0.65,
+    max_tokens: MODEL_MAX_TOKENS,
+    stream: false,
+  };
+
+  const { response, data } = await fetchJsonWithTimeout(
+    DEEPSEEK_CHAT_URL,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    },
+    MODEL_TIMEOUT_MS,
+  );
+
+  if (!response.ok) {
+    const message = normalizeProviderError(
+      'deepseek',
+      response.status,
+      data && data.error && data.error.message ? data.error.message : 'deepseek expand request failed',
+    );
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+
+  const choice = data?.choices?.[0];
+  return normalizeAssistantText(choice?.message?.content, payload);
+}
+
+async function regenerateDistressReply(payload, model, rejectedReply) {
+  const userText = normalizeTextForVector(payload?.message || '');
+  const body = {
+    model,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          '你负责重写一条在情绪场景中“跑题或过冷”的回复。',
+          '硬性要求：',
+          '1) 只围绕用户当前这句话，不延续无关旧话题。',
+          '2) 先共情承接，再分析用户在意的点；不要说教，不要爹味。',
+          '3) 默认不给行动清单；仅当用户明确问“怎么办/建议/方案/步骤”时，才给方案。',
+          '4) 不要出现“先说结论：”、标题、编号列表、代码块。',
+          '5) 输出自然中文，长度 260-900 字。',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: `用户当前输入：${userText || '继续。'}`,
+      },
+      {
+        role: 'assistant',
+        content: `这是不合格草稿（请勿沿用其跑题部分）：${String(rejectedReply || '').trim()}`,
+      },
+      {
+        role: 'user',
+        content: '请给出重写后的最终回复。',
+      },
+    ],
+    temperature: 0.62,
+    max_tokens: MODEL_MAX_TOKENS,
+    stream: false,
+  };
+
+  const { response, data } = await fetchJsonWithTimeout(
+    DEEPSEEK_CHAT_URL,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    },
+    MODEL_TIMEOUT_MS,
+  );
+
+  if (!response.ok) {
+    const message = normalizeProviderError(
+      'deepseek',
+      response.status,
+      data && data.error && data.error.message ? data.error.message : 'deepseek distress rewrite request failed',
+    );
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+
+  const choice = data?.choices?.[0];
+  return normalizeAssistantText(choice?.message?.content, payload);
 }
 
 async function callModelWithFailover(payload) {
@@ -1697,8 +2227,43 @@ async function chatWithDeepSeek(payload) {
   }
 
   const choice = data?.choices?.[0];
-  const assistantText = normalizeAssistantText(choice?.message?.content, payload);
-  const finalReply = enforceAssistantQuality(assistantText || buildFallbackReply(payload), payload);
+  let assistantText = normalizeAssistantText(choice?.message?.content, payload);
+  if (shouldExpandAssistantReply(payload, assistantText)) {
+    try {
+      const expanded = await expandAssistantReply(payload, model, assistantText);
+      if (expanded && expanded.length > assistantText.length) {
+        assistantText = expanded;
+      }
+    } catch (error) {
+      console.warn(`[chat] expand reply skipped: ${error?.message || 'unknown error'}`);
+    }
+  }
+  if (shouldRegenerateForDistress(payload, assistantText)) {
+    try {
+      const regenerated = await regenerateDistressReply(payload, model, assistantText);
+      if (regenerated) {
+        assistantText = regenerated;
+      }
+    } catch (error) {
+      console.warn(`[chat] distress rewrite skipped: ${error?.message || 'unknown error'}`);
+    }
+  }
+
+  let finalReply = enforceAssistantQuality(assistantText, payload);
+  if (shouldRegenerateForDistress(payload, finalReply)) {
+    try {
+      const repaired = await regenerateDistressReply(payload, model, finalReply);
+      if (repaired) {
+        finalReply = enforceAssistantQuality(repaired, payload);
+      }
+    } catch (error) {
+      console.warn(`[chat] distress final rewrite skipped: ${error?.message || 'unknown error'}`);
+    }
+  }
+  if (shouldRegenerateForDistress(payload, finalReply)) {
+    finalReply = enforceAssistantQuality(buildDistressFallbackReply(payload), payload);
+  }
+
   return {
     reply: finalReply,
     model,
@@ -1978,7 +2543,11 @@ app.get('/api/history', async (req, res) => {
     const messages = list.items
       .filter((item) => !isSystemMessageRecord(item))
       .map((item) => mapMessageRecord(auth.pb, item))
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      .sort((a, b) => {
+        const byCreated = String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+        if (byCreated !== 0) return byCreated;
+        return String(a.id || '').localeCompare(String(b.id || ''));
+      });
 
     return res.json({
       messages,
@@ -2274,9 +2843,7 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'internal recap prompt is not allowed on chat endpoint' });
     }
 
-    const directReply = !imageDataUrl
-      ? buildIntentReply({ message, identity: payload.identity || null })
-      : '';
+    const directReply = '';
     if (directReply) {
       const persistStarted = Date.now();
       const persisted = await persistChatWithTimeout(auth, message, imageDataUrl, {
@@ -2398,6 +2965,9 @@ if (!process.env.VERCEL) {
     }
     console.log(
       `[growup-server] deepseek=${DEEPSEEK_API_KEY ? 'configured' : 'missing'} text=${DEEPSEEK_TEXT_MODEL} vision=${DEEPSEEK_VISION_MODEL}`,
+    );
+    console.log(
+      `[growup-server] response-control maxTokens=${MODEL_MAX_TOKENS} directIntentPath=disabled`,
     );
     console.log(
       `[growup-server] pocketbase=${PB_URL ? PB_URL : 'missing'} users=${PB_USERS_COLLECTION} chats=${PB_CHAT_COLLECTION} memories=${PB_MEMORIES_COLLECTION} userApps=${PB_USER_APPS_COLLECTION} appId=${PB_APP_ID}`,
