@@ -12,6 +12,9 @@ export interface ChatApiRequest {
   identity?: {
     userName: string;
     companionName: string;
+    companionGender?: string;
+    companionMbti?: string;
+    companionProfession?: string;
     userBio?: string;
   };
 }
@@ -41,6 +44,9 @@ export interface AuthResponse {
 export interface IdentityPayload {
   userName: string;
   companionName: string;
+  companionGender?: string;
+  companionMbti?: string;
+  companionProfession?: string;
   userBio?: string;
 }
 
@@ -111,6 +117,8 @@ function localizeApiError(raw: string): string {
     return '登录已失效，请重新登录';
   }
   if (lower.includes('history failed')) return '读取聊天记录失败';
+  if (lower.includes('history delete failed')) return '删除聊天记录失败';
+  if (lower.includes('history clear failed')) return '清空聊天记录失败';
   if (lower.includes('identity fetch failed')) return '读取身份设定失败';
   if (lower.includes('identity save failed')) return '保存身份设定失败';
   if (lower.includes('state fetch failed')) return '读取成长数据失败';
@@ -239,6 +247,7 @@ export async function fetchHistory(token: string, limit = 120): Promise<ChatMess
       text: string;
       imageUri?: string;
       createdAt: string;
+      order?: number;
     }>;
   }>(`/api/history?limit=${limit}`, {
     method: 'GET',
@@ -251,7 +260,33 @@ export async function fetchHistory(token: string, limit = 120): Promise<ChatMess
     text: item.text,
     imageUri: item.imageUri,
     createdAt: item.createdAt,
+    order: Number.isFinite(Number(item.order)) ? Number(item.order) : undefined,
   }));
+}
+
+export async function deleteHistoryMessages(
+  token: string,
+  ids: string[],
+): Promise<{ deleted: number; notOwned: number; notFound: number }> {
+  const normalized = Array.from(new Set((ids || []).map((item) => String(item || '').trim()).filter(Boolean)));
+  if (normalized.length === 0) {
+    return { deleted: 0, notOwned: 0, notFound: 0 };
+  }
+
+  return callApi<{ deleted: number; notOwned: number; notFound: number }>('/api/history/delete', {
+    method: 'POST',
+    token,
+    body: { ids: normalized.slice(0, 100) },
+  });
+}
+
+export async function clearHistoryMessages(
+  token: string,
+): Promise<{ deleted: number; vectorCleared: boolean }> {
+  return callApi<{ deleted: number; vectorCleared: boolean }>('/api/history/clear', {
+    method: 'POST',
+    token,
+  });
 }
 
 export async function fetchIdentity(token: string): Promise<IdentityPayload | null> {
@@ -263,6 +298,9 @@ export async function fetchIdentity(token: string): Promise<IdentityPayload | nu
   return {
     userName: data.identity.userName || '用户',
     companionName: data.identity.companionName || '贾维斯',
+    companionGender: data.identity.companionGender || '',
+    companionMbti: data.identity.companionMbti || '',
+    companionProfession: data.identity.companionProfession || '',
     userBio: data.identity.userBio || '',
   };
 }
@@ -272,10 +310,14 @@ export async function saveIdentityRemote(token: string, payload: IdentityPayload
     method: 'POST',
     token,
     body: payload,
+    timeoutMs: 8000,
   });
   return {
     userName: data.identity.userName || '用户',
     companionName: data.identity.companionName || '贾维斯',
+    companionGender: data.identity.companionGender || '',
+    companionMbti: data.identity.companionMbti || '',
+    companionProfession: data.identity.companionProfession || '',
     userBio: data.identity.userBio || '',
   };
 }

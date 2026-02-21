@@ -370,6 +370,15 @@ function buildClipboardFromMessages(messages: ChatMessage[]): string {
 
 function sortMessagesChronologically(messages: ChatMessage[]): ChatMessage[] {
   return [...(messages || [])].sort((a, b) => {
+    const aOrder = Number(a?.order);
+    const bOrder = Number(b?.order);
+    const aHasOrder = Number.isFinite(aOrder);
+    const bHasOrder = Number.isFinite(bOrder);
+
+    if (aHasOrder && bHasOrder && aOrder !== bOrder) return aOrder - bOrder;
+    if (aHasOrder && !bHasOrder) return -1;
+    if (!aHasOrder && bHasOrder) return 1;
+
     const aTime = Date.parse(String(a?.createdAt || ''));
     const bTime = Date.parse(String(b?.createdAt || ''));
     const aValid = Number.isFinite(aTime);
@@ -925,6 +934,14 @@ export default function App() {
     const companionProfession = '';
     const userBio = identityUserBio.trim();
     const editingExistingIdentity = identity.ready;
+    const nextIdentityPayload = {
+      userName,
+      companionName,
+      companionGender,
+      companionMbti,
+      companionProfession,
+      userBio,
+    };
 
     setIdentityBusy(true);
     try {
@@ -946,15 +963,6 @@ export default function App() {
       setIdentityCompanionProfession('');
       setIdentityUserBio(next.userBio);
       await saveIdentity(next);
-
-      await saveIdentityRemote(authSession.token, {
-        userName: next.userName,
-        companionName: next.companionName,
-        companionGender: next.companionGender,
-        companionMbti: next.companionMbti,
-        companionProfession: next.companionProfession,
-        userBio: next.userBio,
-      });
 
       if (editingExistingIdentity) {
         const nowIso = new Date().toISOString();
@@ -1007,6 +1015,10 @@ export default function App() {
       setForceIdentitySetup(false);
       setTab(identitySetupReturnTab);
       setNotice(editingExistingIdentity ? '资料已更新' : `设定完成：${companionName} 已上线`);
+
+      void saveIdentityRemote(authSession.token, nextIdentityPayload).catch(() => {
+        setNotice('资料本地已保存，云端同步失败（可稍后再进设置保存一次）');
+      });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '保存失败，请稍后重试');
     } finally {
@@ -2012,7 +2024,7 @@ function IdentitySetupScreen({
             style={styles.flex}
             contentContainerStyle={styles.identityScrollContent}
             showsVerticalScrollIndicator={false}
-            keyboardShouldPersistTaps="handled"
+            keyboardShouldPersistTaps="always"
             keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
           >
             <Animated.View style={[styles.identityContentWrap, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>

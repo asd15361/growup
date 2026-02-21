@@ -7,6 +7,7 @@ export interface ChatMessage {
   imageUri?: string;
   imageMimeType?: string;
   createdAt: string;
+  order?: number;
 }
 
 export type MemoryCategory =
@@ -64,6 +65,8 @@ export interface PeriodicRecap {
   highlights: string[];
   lowlights: string[];
   actions: string[];
+  milestones?: string[];
+  growths?: string[];
   createdAt: string;
 }
 
