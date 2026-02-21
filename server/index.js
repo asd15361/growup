@@ -211,6 +211,17 @@ function mapMessageRecord(pb, record) {
   };
 }
 
+function isSystemMessageRecord(record) {
+  return String(record?.role || '').toLowerCase() === 'system';
+}
+
+async function listUserChatRecords(pb, userId, page = 1, perPage = 120, sort = '-created') {
+  return pb.collection(PB_CHAT_COLLECTION).getList(page, perPage, {
+    filter: `user = "${userId}"`,
+    sort,
+  });
+}
+
 async function fetchJsonWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1079,12 +1090,10 @@ async function loadRecentMessagesForModel(pb, userId, limit = 12) {
   if (!pb || !userId) return [];
   try {
     const pageSize = Math.max(6, Math.min(30, limit * 2));
-    const list = await pb.collection(PB_CHAT_COLLECTION).getList(1, pageSize, {
-      filter: `user = "${userId}" && role != "system"`,
-      sort: '-created',
-    });
+    const list = await listUserChatRecords(pb, userId, 1, pageSize, '-created');
     const normalized = list.items
       .slice()
+      .filter((item) => !isSystemMessageRecord(item))
       .reverse()
       .map((item) => ({
         role: item.role === 'assistant' ? 'assistant' : 'user',
@@ -1634,11 +1643,10 @@ app.get('/api/history', async (req, res) => {
     const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(limitRaw, 300)) : 120;
 
     const auth = await authByToken(token);
-    const list = await auth.pb.collection(PB_CHAT_COLLECTION).getList(1, limit, {
-      filter: `user = "${auth.user.id}" && role != "system"`,
-    });
+    const list = await listUserChatRecords(auth.pb, auth.user.id, 1, limit, '-created');
 
     const messages = list.items
+      .filter((item) => !isSystemMessageRecord(item))
       .map((item) => mapMessageRecord(auth.pb, item))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
@@ -1720,15 +1728,14 @@ app.post('/api/history/clear', async (req, res) => {
 
     for (let guard = 0; guard < 30; guard += 1) {
       const list = await withTimeout(
-        auth.pb.collection(PB_CHAT_COLLECTION).getList(page, pageSize, {
-          filter: `user = "${auth.user.id}" && role != "system"`,
-          sort: '-created',
-        }),
+        listUserChatRecords(auth.pb, auth.user.id, page, pageSize, '-created'),
         POCKETBASE_TIMEOUT_MS,
         'history clear list',
       );
 
-      const batch = Array.isArray(list?.items) ? list.items.map((item) => item.id).filter(Boolean) : [];
+      const batch = Array.isArray(list?.items)
+        ? list.items.filter((item) => !isSystemMessageRecord(item)).map((item) => item.id).filter(Boolean)
+        : [];
       ids.push(...batch);
 
       const totalPages = Number(list?.totalPages || 1);
