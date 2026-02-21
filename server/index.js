@@ -1331,6 +1331,61 @@ app.get('/api/history', async (req, res) => {
   }
 });
 
+app.post('/api/history/delete', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ error: 'missing bearer token' });
+    }
+
+    const incoming = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = Array.from(new Set(incoming.map((item) => String(item || '').trim()).filter(Boolean))).slice(0, 100);
+    if (ids.length === 0) {
+      return res.status(400).json({ error: 'ids is required' });
+    }
+
+    const auth = await authByToken(token);
+    let deleted = 0;
+    let notOwned = 0;
+    let notFound = 0;
+
+    for (const id of ids) {
+      let record = null;
+      try {
+        record = await withTimeout(
+          auth.pb.collection(PB_CHAT_COLLECTION).getOne(id),
+          POCKETBASE_TIMEOUT_MS,
+          'history delete get',
+        );
+      } catch (error) {
+        const status = Number(error?.status || error?.response?.status || 0);
+        if (status === 404) {
+          notFound += 1;
+          continue;
+        }
+        throw error;
+      }
+
+      if (!record || String(record.user || '') !== String(auth.user.id || '')) {
+        notOwned += 1;
+        continue;
+      }
+
+      await withTimeout(
+        auth.pb.collection(PB_CHAT_COLLECTION).delete(id),
+        POCKETBASE_TIMEOUT_MS,
+        'history delete remove',
+      );
+      deleted += 1;
+    }
+
+    return res.json({ deleted, notOwned, notFound });
+  } catch (error) {
+    const message = error?.response?.message || error?.message || 'history delete failed';
+    return res.status(400).json({ error: message });
+  }
+});
+
 app.get('/api/identity', async (req, res) => {
   try {
     const token = getBearerToken(req);
