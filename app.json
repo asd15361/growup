@@ -1,26 +1,29 @@
 {
   "expo": {
-    "name": "growup",
-    "slug": "growup",
-    "version": "1.0.0",
+    "name": "TIANBO robot",
+    "slug": "tianborobot",
+    "version": "1.19.7",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#0A0A0A"
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.tianboasd.growup"
+      "bundleIdentifier": "com.tianborobot.app",
+      "buildNumber": "126"
     },
     "android": {
-      "package": "com.tianboasd.growup",
+      "package": "com.tianborobot.app",
+      "versionCode": 126,
+      "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "backgroundColor": "#0A0A0A"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
@@ -36,7 +39,7 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow GrowUp to access your photos for AI image understanding."
+          "photosPermission": "Allow TIANBO robot to access your photos for image understanding."
         }
       ]
     ],
@@ -44,6 +47,14 @@
       "eas": {
         "projectId": "69792e39-2ff8-4b04-8fcf-437bcd5cef44"
       }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/69792e39-2ff8-4b04-8fcf-437bcd5cef44",
+      "checkAutomatically": "ON_ERROR_RECOVERY",
+      "fallbackToCacheTimeout": 0
     }
   }
 }
