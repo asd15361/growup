@@ -470,7 +470,7 @@ function mergeRelevantMemories(baseMemories, vectorMemories) {
   ];
 
   for (const item of all) {
-    const normalized = normalizeTextForVector(typeof item === 'string' ? item : '');
+    const normalized = sanitizeMemoryText(typeof item === 'string' ? item : '');
     if (!normalized || seen.has(normalized)) continue;
     seen.add(normalized);
     merged.push(normalized);
@@ -493,12 +493,12 @@ function buildRecapMemoriesFromState(state, queryText, limit = 2) {
 
   const scored = dayRecaps
     .map((item, index) => {
-      const summary = normalizeTextForVector(String(item.summary || ''));
+      const summary = sanitizeMemoryText(String(item.summary || ''));
       const highlights = Array.isArray(item.highlights)
-        ? item.highlights.map((x) => normalizeTextForVector(String(x || ''))).filter(Boolean)
+        ? item.highlights.map((x) => sanitizeMemoryText(String(x || ''))).filter(Boolean)
         : [];
       const actions = Array.isArray(item.actions)
-        ? item.actions.map((x) => normalizeTextForVector(String(x || ''))).filter(Boolean)
+        ? item.actions.map((x) => sanitizeMemoryText(String(x || ''))).filter(Boolean)
         : [];
       const corpus = [summary, ...highlights, ...actions].join(' ').toLowerCase();
 
@@ -880,6 +880,54 @@ function mapMemoryRecord(record) {
   };
 }
 
+const BLOCKED_ASSISTANT_PHRASES = [
+  '我收到了，我们继续推进今天的重点',
+  '继续推进今天的重点',
+];
+const BLOCKED_ASSISTANT_STYLE_SNIPPETS = [
+  '咱俩这关系',
+  '我还以为你',
+];
+
+function looksLikeInternalArtifact(text) {
+  const normalized = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
+  if (!normalized) return false;
+  if (isInternalRecapPrompt(normalized) || isInternalRecapJsonReply(normalized)) return true;
+  if (normalized.includes('```json')) return true;
+  if (normalized.includes('请根据以下聊天记录生成') && normalized.includes('仅返回 JSON')) return true;
+  if (normalized.includes('"summary"') && normalized.includes('"important"') && normalized.includes('"todo"')) return true;
+  return false;
+}
+
+function stripLeadingStageDirections(text) {
+  let next = typeof text === 'string' ? text.trim() : '';
+  for (let i = 0; i < 3; i += 1) {
+    const replaced = next.replace(/^[（(][^）)\n]{1,32}[）)]\s*/u, '').trim();
+    if (replaced === next) break;
+    next = replaced;
+  }
+  return next;
+}
+
+function sanitizeMemoryText(text) {
+  const normalized = normalizeTextForVector(typeof text === 'string' ? text : '');
+  if (!normalized) return '';
+  if (looksLikeInternalArtifact(normalized)) return '';
+  if (BLOCKED_ASSISTANT_PHRASES.some((phrase) => normalized.includes(phrase))) return '';
+  if (BLOCKED_ASSISTANT_STYLE_SNIPPETS.some((phrase) => normalized.includes(phrase))) return '';
+  return normalized;
+}
+
+function isLowValueAssistantHistory(text) {
+  const normalized = stripLeadingStageDirections(typeof text === 'string' ? text : '');
+  if (!normalized) return true;
+  if (looksLikeInternalArtifact(normalized)) return true;
+  if (BLOCKED_ASSISTANT_PHRASES.some((phrase) => normalized.includes(phrase))) return true;
+  if (BLOCKED_ASSISTANT_STYLE_SNIPPETS.some((phrase) => normalized.includes(phrase))) return true;
+  if (normalized.length <= 2 && !/[?？!！]/.test(normalized)) return true;
+  return false;
+}
+
 function normalizeRecentMessages(items, limit = 12) {
   if (!Array.isArray(items)) return [];
   const next = [];
@@ -890,9 +938,13 @@ function normalizeRecentMessages(items, limit = 12) {
     if (!text) continue;
     if (text === '正在输入...') continue;
     if (text.startsWith('网络失败：')) continue;
-    if (isInternalRecapPrompt(text) || isInternalRecapJsonReply(text)) continue;
+    if (looksLikeInternalArtifact(text)) continue;
 
-    const clipped = text.slice(0, 600);
+    if (role === 'assistant' && isLowValueAssistantHistory(text)) continue;
+    const normalizedText = role === 'assistant' ? stripLeadingStageDirections(text) : text;
+    if (!normalizedText) continue;
+
+    const clipped = normalizedText.slice(0, 600);
     const prev = next[next.length - 1];
     if (prev && prev.role === role && prev.text === clipped) continue;
     next.push({ role, text: clipped });
@@ -932,16 +984,21 @@ function buildSystemPrompt(identity) {
   return [
     `你是 ${profile.companionName}。`,
     `你正在和 ${profile.userName} 聊天。`,
-    `你和 ${profile.userName} 是同一战线的真实朋友口吻。`,
+    `你是稳定、克制、真诚的聊天伙伴，目标是把话接住、说人话。`,
     bioLine,
-    '风格要求：自然、真诚、像发小/闺蜜；优先共情和理解，不端着。',
+    '事实约束：只基于用户刚说的话和已给信息回答；不知道就直说，不要编故事。',
+    '禁止虚构：不要编“我在做什么/我在喝咖啡/我看到照片/我拍你肩膀”等现实动作和场景。',
+    '关系约束：不要装熟，不要自称发小/闺蜜/家人，不要替用户起外号（除非用户明确要求）。',
+    '表达约束：不要使用舞台腔和括号旁白（例如“（笑）”“（停顿）”）。',
     '禁止事项：不要催用户做计划、不要打卡式提问、不要模板化“今天小成就”之类话术。',
     '禁止措辞：不要说“作为AI”“我是助手”“陪跑”等身份化表达。',
+    '稳定性约束：不要输出固定套话，尤其不要说“我收到了，我们继续推进今天的重点”。',
+    `身份一致性：用户问“你是谁/你叫什么”时，直接回答“我是${profile.companionName}，在这里和你聊天”。`,
     '连续对话规则：默认这是同一段持续聊天，禁止无依据说“好久不见”“你终于回来了”。',
     '情绪优先规则：如果用户说累、困、要睡、难受、崩溃，先接住情绪并允许休息，不要立刻推进任务。',
     '默认策略：先站在用户角度回应，再顺着用户语境继续聊；只有用户主动要建议时再给简短可落地建议。',
-    '表达限制：少用空泛鸡汤，不要长篇说教，不要连续追问多个问题。',
-    `当你需要表态时，用朋友口吻表达：我愿意做你真实的朋友，会站在你这边。`,
+    '输出限制：优先 1-3 句短回复，不要长篇说教，不要连续追问多个问题。',
+    '格式限制：默认纯文本，不要输出 JSON 或代码块（除非用户明确要求）。',
   ].join('\n');
 }
 function buildContextText(payload) {
@@ -979,10 +1036,12 @@ function buildRecentDialogueMessages(payload) {
   }));
 }
 
-function normalizeAssistantText(content) {
-  if (typeof content === 'string') return content.trim();
-  if (Array.isArray(content)) {
-    return content
+function normalizeAssistantText(content, payload) {
+  let raw = '';
+  if (typeof content === 'string') {
+    raw = content.trim();
+  } else if (Array.isArray(content)) {
+    raw = content
       .map((item) => {
         if (typeof item === 'string') return item;
         if (item && typeof item.text === 'string') return item.text;
@@ -992,18 +1051,62 @@ function normalizeAssistantText(content) {
       .join('\n')
       .trim();
   }
+
+  let text = stripLeadingStageDirections(raw);
+  if (!text) return '';
+
+  if (looksLikeInternalArtifact(text)) return buildFallbackReply(payload);
+  if (BLOCKED_ASSISTANT_PHRASES.some((phrase) => text.includes(phrase))) return buildFallbackReply(payload);
+
+  text = text
+    .replace(/```json[\s\S]*?```/giu, '')
+    .replace(/```[\s\S]*?```/giu, '')
+    .replace(/（[^）\n]{1,32}）/gu, '')
+    .replace(/\([^)\n]{1,32}\)/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  if (!text) return buildFallbackReply(payload);
+  if (BLOCKED_ASSISTANT_STYLE_SNIPPETS.some((phrase) => text.includes(phrase))) return buildFallbackReply(payload);
+  if (text.length <= 2 && !/[?？!！]/.test(text)) return buildFallbackReply(payload);
+  return text;
+}
+
+function buildIntentReply(payload) {
+  const profile = normalizeIdentity(payload?.identity);
+  const text = typeof payload?.message === 'string' ? payload.message.trim() : '';
+  if (!text) return '';
+  const normalized = text.toLowerCase();
+
+  if (/^(在吗|在不|在不在)$/u.test(text)) {
+    return '在，我在这儿。';
+  }
+  if (/^(你好|嗨|hi|hello|nihao|nihao ma)\s*[!！?？]*$/u.test(normalized)) {
+    return '你好，我在。你想聊点什么？';
+  }
+  if (/你(是谁|是什么|叫什么名字|叫啥|是谁啊)/u.test(text)) {
+    return `我是${profile.companionName}，在这里和你聊天。`;
+  }
+  if (/你是什么模型|什么模型|model/u.test(text)) {
+    return `我是${profile.companionName}，底层用的是对话大模型。`;
+  }
+  if (/^\?+$/.test(text) || /^？+$/.test(text)) {
+    return '我在，刚才那句我没听清，你再说一遍就行。';
+  }
   return '';
 }
 
 function buildFallbackReply(payload) {
   const text = typeof payload?.message === 'string' ? payload.message : '';
+  const intentReply = buildIntentReply(payload);
+  if (intentReply) return intentReply;
   if (/[睡困晚安休息]/.test(text)) {
     return '那就先睡吧，晚安。我在，明天再接着聊。';
   }
   if (/[累崩溃焦虑难受压力烦]/.test(text)) {
     return '听到了，你现在不好受。先缓一缓，我在这儿。';
   }
-  return '我在，接着你刚才的话继续聊。';
+  return '我在，接着说。';
 }
 
 function normalizeProviderError(provider, status, rawMessage) {
@@ -1115,7 +1218,7 @@ async function chatWithDeepSeek(payload) {
   }
 
   const choice = data?.choices?.[0];
-  const assistantText = normalizeAssistantText(choice?.message?.content);
+  const assistantText = normalizeAssistantText(choice?.message?.content, payload);
   return {
     reply: assistantText || buildFallbackReply(payload),
     model,
@@ -1531,6 +1634,35 @@ app.post('/api/chat', async (req, res) => {
     }
     if (isInternalRecapPrompt(message)) {
       return res.status(400).json({ error: 'internal recap prompt is not allowed on chat endpoint' });
+    }
+
+    const directReply = !imageDataUrl
+      ? buildIntentReply({ message, identity: payload.identity || null })
+      : '';
+    if (directReply) {
+      const persistStarted = Date.now();
+      const persisted = await persistChatWithTimeout(auth, message, imageDataUrl, {
+        reply: directReply,
+        model: 'rule-intent',
+        usage: null,
+      });
+      checkpoint('persistMs', persistStarted);
+      checkpoint('totalMs', startedAt);
+
+      if (shouldDebugTimings) {
+        res.setHeader('x-chat-total-ms', String(metrics.totalMs || 0));
+        res.setHeader('x-chat-auth-ms', String(metrics.authMs || 0));
+        res.setHeader('x-chat-context-ms', '0');
+        res.setHeader('x-chat-model-ms', '0');
+        res.setHeader('x-chat-persist-ms', String(metrics.persistMs || 0));
+      }
+
+      return res.json({
+        reply: directReply,
+        model: 'rule-intent',
+        usage: null,
+        persisted,
+      });
     }
 
     const contextStarted = Date.now();
