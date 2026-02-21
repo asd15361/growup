@@ -215,10 +215,9 @@ function isSystemMessageRecord(record) {
   return String(record?.role || '').toLowerCase() === 'system';
 }
 
-async function listUserChatRecords(pb, userId, page = 1, perPage = 120, sort = '-created') {
+async function listUserChatRecords(pb, userId, page = 1, perPage = 120) {
   return pb.collection(PB_CHAT_COLLECTION).getList(page, perPage, {
     filter: `user = "${userId}"`,
-    sort,
   });
 }
 
@@ -1090,10 +1089,11 @@ async function loadRecentMessagesForModel(pb, userId, limit = 12) {
   if (!pb || !userId) return [];
   try {
     const pageSize = Math.max(6, Math.min(30, limit * 2));
-    const list = await listUserChatRecords(pb, userId, 1, pageSize, '-created');
+    const list = await listUserChatRecords(pb, userId, 1, pageSize);
     const normalized = list.items
       .slice()
       .filter((item) => !isSystemMessageRecord(item))
+      .sort((a, b) => String(b.created || '').localeCompare(String(a.created || '')))
       .reverse()
       .map((item) => ({
         role: item.role === 'assistant' ? 'assistant' : 'user',
@@ -1643,7 +1643,7 @@ app.get('/api/history', async (req, res) => {
     const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(limitRaw, 300)) : 120;
 
     const auth = await authByToken(token);
-    const list = await listUserChatRecords(auth.pb, auth.user.id, 1, limit, '-created');
+    const list = await listUserChatRecords(auth.pb, auth.user.id, 1, limit);
 
     const messages = list.items
       .filter((item) => !isSystemMessageRecord(item))
@@ -1728,7 +1728,7 @@ app.post('/api/history/clear', async (req, res) => {
 
     for (let guard = 0; guard < 30; guard += 1) {
       const list = await withTimeout(
-        listUserChatRecords(auth.pb, auth.user.id, page, pageSize, '-created'),
+        listUserChatRecords(auth.pb, auth.user.id, page, pageSize),
         POCKETBASE_TIMEOUT_MS,
         'history clear list',
       );
