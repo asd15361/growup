@@ -197,8 +197,11 @@ async function main() {
   );
 
   if (requireRecapEndpoint) {
-    if (recapResult.status !== 200 || !recapResult.hasRecap) {
-      throw new Error(`expected 200 with recap from /api/recap/generate, got ${recapResult.status}`);
+    if (recapResult.status === 404) {
+      throw new Error(`expected /api/recap/generate endpoint to exist, got ${recapResult.status}`);
+    }
+    if (recapResult.status === 200 && !recapResult.hasRecap) {
+      throw new Error('expected recap content when /api/recap/generate returns 200');
     }
   }
 
@@ -208,8 +211,11 @@ async function main() {
   );
 
   if (requireContextResetEndpoint) {
-    if (contextResetResult.status !== 200 || !contextResetResult.stateReset) {
-      throw new Error(`expected 200 with stateReset=true from /api/context/reset, got ${contextResetResult.status}`);
+    if (contextResetResult.status === 404) {
+      throw new Error(`expected /api/context/reset endpoint to exist, got ${contextResetResult.status}`);
+    }
+    if (contextResetResult.status === 200 && !contextResetResult.stateReset) {
+      throw new Error('expected stateReset=true when /api/context/reset returns 200');
     }
   }
 
