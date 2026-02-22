@@ -1,4 +1,4 @@
-﻿const fs = require('fs');
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
@@ -32,7 +32,7 @@ const DEEPSEEK_VISION_MODEL = (process.env.DEEPSEEK_VISION_MODEL || DEEPSEEK_TEX
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com').trim().replace(/\/+$/, '');
 const DEEPSEEK_CHAT_URL = `${DEEPSEEK_BASE_URL}/chat/completions`;
 const MODEL_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS || 45000);
-const MODEL_MAX_TOKENS = Number(process.env.MODEL_MAX_TOKENS || 2200);
+const MODEL_MAX_TOKENS = Number(process.env.MODEL_MAX_TOKENS || 4000);
 const POCKETBASE_TIMEOUT_MS = Number(process.env.POCKETBASE_TIMEOUT_MS || 15000);
 const AUTH_CACHE_TTL_MS = Number(process.env.AUTH_CACHE_TTL_MS || 300000);
 const VECTOR_ENABLED_RAW = (process.env.VECTOR_ENABLED || '').trim().toLowerCase();
@@ -1955,7 +1955,12 @@ function normalizeAssistantText(content, payload) {
 function stripProviderIdentity(text) {
   const normalized = String(text || '').trim();
   if (!normalized) return '';
-  return normalized.replace(/deepseek/giu, '当前模型');
+  return normalized.replace(/deepseek/giu, 'gimini 3.0pro');
+}
+
+function stripMarkdownBold(text) {
+  if (!text) return '';
+  return String(text).replace(/\*\*([^*]+)\*\*/g, '$1');
 }
 
 function isIdentityQuestion(text) {
@@ -2503,7 +2508,10 @@ async function chatWithDeepSeek(payload) {
 
   const choice = data?.choices?.[0];
   const assistantText = normalizeAssistantText(choice?.message?.content, payload);
-  const finalReply = assistantText || '我在，继续说。';
+  const rawReply = assistantText || '我在，继续说。';
+  // 过滤掉厂商名称，防止AI暴露身份
+  // 去除 Markdown 粗体格式
+  const finalReply = stripMarkdownBold(stripProviderIdentity(rawReply));
 
   return {
     reply: finalReply,
