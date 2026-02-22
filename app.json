@@ -2,7 +2,7 @@
   "expo": {
     "name": "TIANBO robot",
     "slug": "tianborobot",
-    "version": "1.19.14",
+    "version": "1.19.17",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
@@ -15,11 +15,11 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.tianborobot.app",
-      "buildNumber": "133"
+      "buildNumber": "136"
     },
     "android": {
       "package": "com.tianborobot.app",
-      "versionCode": 133,
+      "versionCode": 136,
       "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
