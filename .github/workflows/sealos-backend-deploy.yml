@@ -1,0 +1,43 @@
+name: Sealos Backend Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_deploy_version:
+        description: "Expected /api/version value"
+        required: false
+        default: ""
+  push:
+    branches:
+      - master
+    paths:
+      - "server/**"
+      - "scripts/verify-sealos-api.js"
+      - "scripts/deploy-sealos-api.js"
+      - "Dockerfile.sealos-api"
+
+jobs:
+  deploy-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Trigger Sealos redeploy and strict verify
+        env:
+          API_BASE_URL: ${{ secrets.SEALOS_API_BASE_URL }}
+          SEALOS_REDEPLOY_WEBHOOK_URL: ${{ secrets.SEALOS_REDEPLOY_WEBHOOK_URL }}
+          SEALOS_REDEPLOY_WEBHOOK_TOKEN: ${{ secrets.SEALOS_REDEPLOY_WEBHOOK_TOKEN }}
+          SEALOS_REDEPLOY_WEBHOOK_TOKEN_HEADER: ${{ secrets.SEALOS_REDEPLOY_WEBHOOK_TOKEN_HEADER }}
+          DEPLOY_VERIFY_TIMEOUT_MS: "900000"
+          DEPLOY_VERIFY_INTERVAL_MS: "15000"
+          EXPECTED_DEPLOY_VERSION: ${{ github.event.inputs.expected_deploy_version }}
+        run: npm run deploy:sealos

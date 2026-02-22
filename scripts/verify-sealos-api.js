@@ -36,6 +36,16 @@ async function checkHealth(baseUrl) {
   };
 }
 
+async function checkVersion(baseUrl) {
+  const url = `${baseUrl}/api/version`;
+  const response = await fetch(url, { method: 'GET' });
+  const body = await parseJsonSafe(response);
+  return {
+    status: response.status,
+    version: typeof body?.version === 'string' ? body.version : '',
+  };
+}
+
 async function checkChatWithoutToken(baseUrl) {
   const url = `${baseUrl}/api/chat`;
   const response = await fetch(url, {
@@ -51,6 +61,8 @@ async function checkChatWithoutToken(baseUrl) {
   return {
     status: response.status,
     error: typeof body?.error === 'string' ? body.error : '',
+    code: typeof body?.code === 'string' ? body.code : '',
+    requestId: typeof body?.requestId === 'string' ? body.requestId : '',
   };
 }
 
@@ -75,21 +87,48 @@ async function registerSmokeUser(baseUrl) {
   };
 }
 
-async function checkInternalRecapBlocked(baseUrl, token) {
-  const url = `${baseUrl}/api/chat`;
-  const message = '请根据以下聊天记录生成\n仅返回 JSON\n"summary"\n"important"\n"todo"';
+async function checkRecapGenerate(baseUrl, token) {
+  const url = `${baseUrl}/api/recap/generate`;
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({
+      period: 'day',
+      label: '2026-02-22',
+      startDate: '2026-02-22',
+      endDate: '2026-02-22',
+      messages: [
+        { id: 'm1', role: 'user', text: '今天推进了需求梳理', createdAt: new Date().toISOString() },
+        { id: 'm2', role: 'assistant', text: '听起来你完成了关键一步', createdAt: new Date().toISOString() },
+      ],
+    }),
   });
   const body = await parseJsonSafe(response);
   return {
     status: response.status,
     error: typeof body?.error === 'string' ? body.error : '',
+    hasRecap: Boolean(body?.recap && typeof body.recap === 'object'),
+  };
+}
+
+async function checkContextReset(baseUrl, token) {
+  const url = `${baseUrl}/api/context/reset`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({}),
+  });
+  const body = await parseJsonSafe(response);
+  return {
+    status: response.status,
+    error: typeof body?.error === 'string' ? body.error : '',
+    stateReset: Boolean(body?.stateReset),
   };
 }
 
@@ -98,6 +137,15 @@ async function main() {
     process.argv[2] || process.env.API_BASE_URL || process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL,
   );
   const requireVector = ['1', 'true', 'yes', 'on'].includes(String(process.env.REQUIRE_VECTOR || '').trim().toLowerCase());
+  const requireErrorModel = ['1', 'true', 'yes', 'on'].includes(String(process.env.REQUIRE_ERROR_MODEL || '').trim().toLowerCase());
+  const requireRecapEndpoint = ['1', 'true', 'yes', 'on'].includes(String(process.env.REQUIRE_RECAP_ENDPOINT || '').trim().toLowerCase());
+  const requireContextResetEndpoint = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.REQUIRE_CONTEXT_RESET_ENDPOINT || '').trim().toLowerCase(),
+  );
+  const requireVersionEndpoint = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.REQUIRE_VERSION_ENDPOINT || '').trim().toLowerCase(),
+  );
+  const expectedVersion = String(process.env.EXPECTED_DEPLOY_VERSION || '').trim();
 
   if (!baseUrl) {
     throw new Error('missing API base URL');
@@ -114,23 +162,55 @@ async function main() {
     throw new Error('expected vector.enabled=true in /api/health');
   }
 
+  const version = await checkVersion(baseUrl);
+  console.log(`[verify] GET /api/version -> ${version.status}${version.version ? `, version=${version.version}` : ''}`);
+  if (requireVersionEndpoint && version.status !== 200) {
+    throw new Error(`expected 200 from /api/version, got ${version.status}`);
+  }
+  if (expectedVersion && version.version !== expectedVersion) {
+    throw new Error(`expected /api/version=${expectedVersion}, got ${version.version || 'empty'}`);
+  }
+
   const chat = await checkChatWithoutToken(baseUrl);
-  console.log(`[verify] POST /api/chat (no token) -> ${chat.status}${chat.error ? `, error=${chat.error}` : ''}`);
+  console.log(
+    `[verify] POST /api/chat (no token) -> ${chat.status}${chat.error ? `, error=${chat.error}` : ''}${chat.code ? `, code=${chat.code}` : ''}${chat.requestId ? `, requestId=${chat.requestId}` : ''}`,
+  );
 
   if (chat.status !== 401) {
     throw new Error(`expected 401 from /api/chat without token, got ${chat.status}`);
+  }
+  if (requireErrorModel) {
+    if (chat.code !== 'AUTH_MISSING_TOKEN') {
+      throw new Error(`expected code AUTH_MISSING_TOKEN from /api/chat without token, got ${chat.code || 'empty'}`);
+    }
+    if (!chat.requestId) {
+      throw new Error('expected requestId in /api/chat without token response');
+    }
   }
 
   const smokeUser = await registerSmokeUser(baseUrl);
   console.log(`[verify] POST /api/auth/register (smoke) -> 200, email=${smokeUser.email}`);
 
-  const blocked = await checkInternalRecapBlocked(baseUrl, smokeUser.token);
+  const recapResult = await checkRecapGenerate(baseUrl, smokeUser.token);
   console.log(
-    `[verify] POST /api/chat (internal recap with token) -> ${blocked.status}${blocked.error ? `, error=${blocked.error}` : ''}`,
+    `[verify] POST /api/recap/generate -> ${recapResult.status}${recapResult.error ? `, error=${recapResult.error}` : ''}`,
   );
 
-  if (blocked.status !== 400) {
-    throw new Error(`expected 400 from /api/chat internal recap guard, got ${blocked.status}`);
+  if (requireRecapEndpoint) {
+    if (recapResult.status !== 200 || !recapResult.hasRecap) {
+      throw new Error(`expected 200 with recap from /api/recap/generate, got ${recapResult.status}`);
+    }
+  }
+
+  const contextResetResult = await checkContextReset(baseUrl, smokeUser.token);
+  console.log(
+    `[verify] POST /api/context/reset -> ${contextResetResult.status}${contextResetResult.error ? `, error=${contextResetResult.error}` : ''}`,
+  );
+
+  if (requireContextResetEndpoint) {
+    if (contextResetResult.status !== 200 || !contextResetResult.stateReset) {
+      throw new Error(`expected 200 with stateReset=true from /api/context/reset, got ${contextResetResult.status}`);
+    }
   }
 
   console.log('[verify] pass');
@@ -138,5 +218,5 @@ async function main() {
 
 main().catch((error) => {
   console.error(`[verify] fail: ${error && error.message ? error.message : String(error)}`);
-  process.exit(1);
+  process.exitCode = 1;
 });

@@ -1,6 +1,6 @@
 {
   "name": "growup",
-  "version": "1.19.7",
+  "version": "1.19.11",
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
@@ -9,6 +9,7 @@
     "web": "expo start --web",
     "server": "node server/index.js",
     "smoke:sealos": "node scripts/verify-sealos-api.js",
+    "deploy:sealos": "node scripts/deploy-sealos-api.js",
     "deploy:pocketbase": "node scripts/deploy-pocketbase-schema.js",
     "profile:chat": "node scripts/profile-chat-latency.js",
     "build:apk": "node scripts/build-android-release.js",

@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const packageJson = require('../package.json');
 
 let PocketBase;
 try {
@@ -21,6 +22,10 @@ dotenv.config();
 const app = express();
 
 const PORT = Number(process.env.PORT || 8787);
+const APP_VERSION = String(process.env.APP_VERSION || packageJson.version || '0.0.0').trim();
+const DEPLOY_GIT_SHA = String(process.env.DEPLOY_GIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA || '').trim();
+const DEPLOY_IMAGE_DIGEST = String(process.env.DEPLOY_IMAGE_DIGEST || '').trim();
+const BUILD_TIME = String(process.env.BUILD_TIME || '').trim();
 const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
 const DEEPSEEK_TEXT_MODEL = (process.env.DEEPSEEK_TEXT_MODEL || 'deepseek-chat').trim();
 const DEEPSEEK_VISION_MODEL = (process.env.DEEPSEEK_VISION_MODEL || DEEPSEEK_TEXT_MODEL).trim();
@@ -73,6 +78,25 @@ let vectorBackoffUntil = 0;
 const authCache = new Map();
 const chatPersistQueueByUser = new Map();
 let chatTurnSeqCounter = 0;
+const loginRateLimit = new Map();
+const registerRateLimit = new Map();
+const chatIpRateLimit = new Map();
+const chatUserRateLimit = new Map();
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+const RATE_LIMIT_LOGIN_MAX = Number(process.env.RATE_LIMIT_LOGIN_MAX || 8);
+const RATE_LIMIT_REGISTER_MAX = Number(process.env.RATE_LIMIT_REGISTER_MAX || 6);
+const RATE_LIMIT_CHAT_IP_MAX = Number(process.env.RATE_LIMIT_CHAT_IP_MAX || 40);
+const RATE_LIMIT_CHAT_USER_MAX = Number(process.env.RATE_LIMIT_CHAT_USER_MAX || 30);
+const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS || 1500);
+const OPS_METRICS_KEY = String(process.env.OPS_METRICS_KEY || '').trim();
+const apiMetrics = {
+  startedAt: new Date().toISOString(),
+  totalRequests: 0,
+  totalErrors: 0,
+  byStatus: {},
+  byRoute: {},
+  byErrorCode: {},
+};
 
 if (!PB_APP_ID_WHITELIST.includes(PB_APP_ID)) {
   throw new Error(
@@ -86,6 +110,153 @@ if (PB_URL === LEGACY_PB_URL) {
 
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
+
+function requestIdFromHeader(value) {
+  const candidate = String(value || '').trim();
+  if (!candidate) return '';
+  if (!/^[a-zA-Z0-9._:-]{8,128}$/.test(candidate)) return '';
+  return candidate;
+}
+
+function getClientIp(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '').trim();
+  if (xff) {
+    const first = xff.split(',')[0]?.trim();
+    if (first) return first;
+  }
+  const realIp = String(req.headers['x-real-ip'] || '').trim();
+  if (realIp) return realIp;
+  return String(req.socket?.remoteAddress || req.ip || 'unknown').trim() || 'unknown';
+}
+
+function logEvent(level, message, context = {}) {
+  const safeLevel = String(level || 'info').toLowerCase();
+  const event = {
+    ts: new Date().toISOString(),
+    level: safeLevel,
+    message,
+    ...context,
+  };
+  const payload = JSON.stringify(event);
+  if (safeLevel === 'warn') {
+    console.warn(payload);
+    return;
+  }
+  if (safeLevel === 'error') {
+    console.error(payload);
+    return;
+  }
+  console.log(payload);
+}
+
+function bumpMetric(bucket, key, by = 1) {
+  const metricKey = String(key || 'unknown');
+  bucket[metricKey] = Number(bucket[metricKey] || 0) + by;
+}
+
+function trackRequestMetric(req, statusCode, elapsedMs) {
+  apiMetrics.totalRequests += 1;
+  if (statusCode >= 400) apiMetrics.totalErrors += 1;
+  bumpMetric(apiMetrics.byStatus, String(statusCode));
+  const routeKey = `${req.method} ${req.path}`;
+  const existing = apiMetrics.byRoute[routeKey] || {
+    count: 0,
+    errors: 0,
+    totalMs: 0,
+    maxMs: 0,
+  };
+  existing.count += 1;
+  existing.totalMs += elapsedMs;
+  if (statusCode >= 400) existing.errors += 1;
+  if (elapsedMs > existing.maxMs) existing.maxMs = elapsedMs;
+  apiMetrics.byRoute[routeKey] = existing;
+}
+
+function hasOpsMetricsAccess(req) {
+  if (!OPS_METRICS_KEY) return false;
+  const fromHeader = String(req.headers['x-ops-key'] || '').trim();
+  const fromQuery = String(req.query?.key || '').trim();
+  const provided = fromHeader || fromQuery;
+  return Boolean(provided) && provided === OPS_METRICS_KEY;
+}
+
+function consumeRateLimit(bucket, key, windowMs, maxHits) {
+  const now = Date.now();
+  if (bucket.size > 5000) {
+    for (const [entryKey, value] of bucket.entries()) {
+      if (!value || Number(value.resetAt || 0) <= now) {
+        bucket.delete(entryKey);
+      }
+    }
+  }
+
+  const current = bucket.get(key);
+  if (!current || now >= current.resetAt) {
+    const next = { hits: 1, resetAt: now + windowMs };
+    bucket.set(key, next);
+    return { allowed: true, remaining: Math.max(0, maxHits - 1), resetAt: next.resetAt };
+  }
+
+  current.hits += 1;
+  bucket.set(key, current);
+  const remaining = Math.max(0, maxHits - current.hits);
+  return { allowed: current.hits <= maxHits, remaining, resetAt: current.resetAt };
+}
+
+function enforceRateLimit(req, res, bucket, key, windowMs, maxHits, scope) {
+  const result = consumeRateLimit(bucket, key, windowMs, maxHits);
+  res.setHeader('x-ratelimit-limit', String(maxHits));
+  res.setHeader('x-ratelimit-remaining', String(result.remaining));
+  res.setHeader('x-ratelimit-reset', String(result.resetAt));
+  if (result.allowed) return false;
+
+  logEvent('warn', 'rate-limit-hit', {
+    requestId: req.requestId,
+    scope,
+    key,
+    path: req.path,
+    method: req.method,
+  });
+  sendApiError(req, res, 429, 'too many requests, please retry later', 'RATE_LIMITED');
+  return true;
+}
+
+app.use((req, res, next) => {
+  const reqId = requestIdFromHeader(req.headers['x-request-id']) || crypto.randomUUID();
+  req.requestId = reqId;
+  res.setHeader('x-request-id', reqId);
+  next();
+});
+
+app.use((req, res, next) => {
+  res.setHeader('x-content-type-options', 'nosniff');
+  res.setHeader('x-frame-options', 'DENY');
+  res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
+  res.setHeader('x-xss-protection', '0');
+  if (String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https') {
+    res.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    const elapsedMs = Date.now() - startedAt;
+    trackRequestMetric(req, res.statusCode, elapsedMs);
+    if (res.statusCode >= 400 || elapsedMs >= SLOW_REQUEST_MS) {
+      logEvent(res.statusCode >= 500 ? 'error' : 'warn', 'request-finished', {
+        requestId: req.requestId,
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        elapsedMs,
+        ip: getClientIp(req),
+      });
+    }
+  });
+  next();
+});
 
 function createPb() {
   if (!PB_URL) {
@@ -158,6 +329,12 @@ function parseJwtPayload(token) {
   } catch {
     return null;
   }
+}
+
+function getJwtExpiryMs(token) {
+  const payload = parseJwtPayload(token);
+  const exp = Number(payload?.exp || 0) * 1000;
+  return Number.isFinite(exp) && exp > 0 ? exp : 0;
 }
 
 function isInternalRecapPrompt(message) {
@@ -317,48 +494,95 @@ async function ensureUserAppBinding(pb, user) {
 }
 
 function hasAppAccess(auth) {
-  const status = normalizeStatus(auth?.userApp?.status || auth?.user?.status || PB_DEFAULT_USER_STATUS);
+  if (!auth?.user || !auth?.userApp) return false;
+  const status = normalizeStatus(auth.userApp.status || auth.user.status || PB_DEFAULT_USER_STATUS);
   return status !== 'blocked' && status !== 'disabled' && status !== 'inactive';
+}
+
+function statusForApiError(message, fallback = 400) {
+  const normalized = String(message || '').toLowerCase();
+  if (
+    normalized.includes('missing bearer token')
+    || normalized.includes('invalid token')
+    || normalized.includes('token expired')
+    || normalized.includes('auth')
+  ) {
+    return 401;
+  }
+  if (normalized.includes('app access blocked') || normalized.includes('forbidden')) {
+    return 403;
+  }
+  if (normalized.includes('timeout')) {
+    return 504;
+  }
+  return fallback;
+}
+
+function errorCodeForMessage(message, status) {
+  const normalized = String(message || '').toLowerCase();
+  if (status === 429) return 'RATE_LIMITED';
+  if (normalized.includes('missing bearer token')) return 'AUTH_MISSING_TOKEN';
+  if (normalized.includes('token expired')) return 'AUTH_TOKEN_EXPIRED';
+  if (normalized.includes('invalid token')) return 'AUTH_INVALID_TOKEN';
+  if (normalized.includes('auth')) return 'AUTH_FAILED';
+  if (normalized.includes('app access blocked') || normalized.includes('forbidden')) return 'ACCESS_BLOCKED';
+  if (normalized.includes('timeout')) return 'UPSTREAM_TIMEOUT';
+  if (normalized.includes('validation')) return 'VALIDATION_FAILED';
+  if (status >= 500) return 'INTERNAL_ERROR';
+  return 'BAD_REQUEST';
+}
+
+function sendApiError(req, res, status, message, code = '') {
+  const finalCode = code || errorCodeForMessage(message, status);
+  bumpMetric(apiMetrics.byErrorCode, finalCode);
+  return res.status(status).json({
+    error: String(message || 'request failed'),
+    code: finalCode,
+    requestId: req.requestId || '',
+  });
 }
 
 async function authByToken(token) {
   const now = Date.now();
+  if (authCache.size > 2000) {
+    for (const [cachedToken, value] of authCache.entries()) {
+      if (!value || Number(value.expiresAt || 0) <= now) {
+        authCache.delete(cachedToken);
+      }
+    }
+  }
+
+  const tokenExpMs = getJwtExpiryMs(token);
   const cached = authCache.get(token);
   if (cached && cached.expiresAt > now) {
     const pbCached = createPb();
     pbCached.authStore.save(token, null);
-    const userApp = await ensureUserAppBinding(pbCached, cached.user);
-    const role = normalizeRole(userApp?.role || cached.user?.role || PB_DEFAULT_USER_ROLE);
+    let refreshed = null;
+    try {
+      refreshed = await withTimeout(
+        pbCached.collection(PB_USERS_COLLECTION).authRefresh(),
+        POCKETBASE_TIMEOUT_MS,
+        'auth refresh (cached)'
+      );
+    } catch (error) {
+      authCache.delete(token);
+      throw error;
+    }
+    const refreshedToken = refreshed.token || token;
+    const refreshedUser = refreshed.record || cached.user;
+    const userApp = await ensureUserAppBinding(pbCached, refreshedUser);
+    const role = normalizeRole(userApp?.role || refreshedUser?.role || PB_DEFAULT_USER_ROLE);
+    const cacheTtlMs = Math.max(30000, AUTH_CACHE_TTL_MS);
+    const refreshedExpMs = getJwtExpiryMs(refreshedToken);
+    const expiresAt = refreshedExpMs > 0 ? Math.min(refreshedExpMs, now + cacheTtlMs) : now + cacheTtlMs;
+    authCache.set(refreshedToken, {
+      user: { ...refreshedUser, role },
+      expiresAt,
+    });
     return {
       pb: pbCached,
-      token,
-      user: { ...cached.user, role },
-      userApp,
-    };
-  }
-
-  const jwtPayload = parseJwtPayload(token);
-  const expMs = Number(jwtPayload?.exp || 0) * 1000;
-  const tokenUserId = String(jwtPayload?.id || jwtPayload?.sub || '').trim();
-  if (tokenUserId && Number.isFinite(expMs) && expMs > now + 5000) {
-    const user = {
-      id: tokenUserId,
-      email: typeof jwtPayload?.email === 'string' ? jwtPayload.email : '',
-      name: typeof jwtPayload?.name === 'string' ? jwtPayload.name : '',
-      role: typeof jwtPayload?.role === 'string' ? jwtPayload.role : '',
-      status: typeof jwtPayload?.status === 'string' ? jwtPayload.status : '',
-    };
-    const expiresAt = Math.min(expMs, now + Math.max(30000, AUTH_CACHE_TTL_MS));
-    authCache.set(token, { user, expiresAt });
-
-    const pbFast = createPb();
-    pbFast.authStore.save(token, null);
-    const userApp = await ensureUserAppBinding(pbFast, user);
-    const role = normalizeRole(userApp?.role || user.role || PB_DEFAULT_USER_ROLE);
-    return {
-      pb: pbFast,
-      token,
-      user: { ...user, role },
+      token: refreshedToken,
+      user: { ...refreshedUser, role },
       userApp,
     };
   }
@@ -370,10 +594,20 @@ async function authByToken(token) {
   const userApp = await ensureUserAppBinding(pb, user);
   const role = normalizeRole(userApp?.role || user?.role || PB_DEFAULT_USER_ROLE);
   if (user && user.id) {
+    const cacheTtlMs = Math.max(30000, AUTH_CACHE_TTL_MS);
+    const refreshedToken = authData.token || token;
+    const refreshedTokenExpMs = getJwtExpiryMs(refreshedToken);
+    const expiresAt = refreshedTokenExpMs > 0 ? Math.min(refreshedTokenExpMs, now + cacheTtlMs) : now + cacheTtlMs;
     authCache.set(token, {
       user: { ...user, role },
-      expiresAt: now + Math.max(30000, AUTH_CACHE_TTL_MS),
+      expiresAt,
     });
+    if (refreshedToken && refreshedToken !== token) {
+      authCache.set(refreshedToken, {
+        user: { ...user, role },
+        expiresAt,
+      });
+    }
   }
   return {
     pb,
@@ -1545,6 +1779,7 @@ function normalizeRecentMessages(items, limit = 12) {
     if (text === '正在输入...') continue;
     if (text.startsWith('网络失败：')) continue;
     if (looksLikeInternalArtifact(text)) continue;
+    if (role === 'assistant' && isUnsafeAssistantStyle(text)) continue;
 
     const clipped = text.slice(0, 600);
     const prev = next[next.length - 1];
@@ -1614,17 +1849,7 @@ function detectResponseMode(payload) {
 }
 
 function buildSystemPrompt(identity) {
-  const profile = normalizeIdentity(identity);
-  const bioLine = profile.userBio ? `用户自我介绍：${profile.userBio}` : '';
-  const genderLine = profile.companionGender ? `你的角色性别设定：${profile.companionGender}` : '';
-  return [
-    `你是 ${profile.companionName}。`,
-    `你正在和 ${profile.userName} 聊天。`,
-    '自然聊天，按用户当下语气自由发挥。',
-    genderLine,
-    bioLine,
-    '唯一硬规则：不要透露或提到 DeepSeek（任何大小写写法都不行）。',
-  ].filter(Boolean).join('\n');
+  return '';
 }
 
 function buildMemoryHintText(payload) {
@@ -1661,12 +1886,43 @@ function buildMemoryHintText(payload) {
   return lines.join('\n').trim();
 }
 
+function buildRecapContextText(payload) {
+  const recaps = Array.isArray(payload?.recapRecords) ? payload.recapRecords : [];
+  if (recaps.length === 0) return '';
+
+  const lines = recaps
+    .slice(0, 120)
+    .map((item) => {
+      const period = String(item?.period || '').trim();
+      const label = String(item?.label || '').trim();
+      const summary = String(item?.summary || '').replace(/\s+/g, ' ').trim();
+      const highlights = Array.isArray(item?.highlights)
+        ? item.highlights.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 3)
+        : [];
+      const actions = Array.isArray(item?.actions)
+        ? item.actions.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 3)
+        : [];
+      if (!period || !label || !summary) return '';
+      return JSON.stringify({ period, label, summary, highlights, actions });
+    })
+    .filter(Boolean);
+
+  if (lines.length === 0) return '';
+  return `以下是用户历史复盘记录（JSONL，每行一条，可按需参考）：\n${lines.join('\n')}`;
+}
+
 function buildRecentDialogueMessages(payload) {
   const recentMessages = normalizeRecentMessages(payload.recentMessages, 16);
   return recentMessages.map((item) => ({
     role: item.role,
-    content: item.text,
+    content: item.role === 'assistant' ? stripLeadingStageDirections(item.text) : item.text,
   }));
+}
+
+function shouldAttachRecapContext(userText) {
+  const text = normalizeTextForVector(userText || '');
+  if (!text) return false;
+  return /(复盘|总结|回顾|梳理|历史记录|之前聊过|上次聊到|回看|归纳)/u.test(text);
 }
 
 function normalizeAssistantText(content, payload) {
@@ -2171,22 +2427,23 @@ async function callModelWithFailover(payload) {
 
 function buildMessages(payload) {
   const userText = typeof payload.message === 'string' ? payload.message.trim() : '';
-  const systemPrompt = buildSystemPrompt(payload.identity);
-  const memoryHintText = buildMemoryHintText(payload);
   const recentDialogue = buildRecentDialogueMessages(payload);
+  const attachRecapContext = shouldAttachRecapContext(userText);
+  const recapContextText = attachRecapContext ? buildRecapContextText(payload) : '';
+  const memoryHintText = attachRecapContext ? buildMemoryHintText(payload) : '';
 
   if (!payload.imageDataUrl) {
     return [
-      { role: 'system', content: systemPrompt },
-      ...(memoryHintText ? [{ role: 'system', content: memoryHintText }] : []),
+      ...(recapContextText ? [{ role: 'user', content: recapContextText }] : []),
+      ...(memoryHintText ? [{ role: 'user', content: memoryHintText }] : []),
       ...recentDialogue,
       { role: 'user', content: userText || '继续。' },
     ];
   }
 
   return [
-    { role: 'system', content: systemPrompt },
-    ...(memoryHintText ? [{ role: 'system', content: memoryHintText }] : []),
+    ...(recapContextText ? [{ role: 'user', content: recapContextText }] : []),
+    ...(memoryHintText ? [{ role: 'user', content: memoryHintText }] : []),
     ...recentDialogue,
     {
       role: 'user',
@@ -2246,7 +2503,7 @@ async function chatWithDeepSeek(payload) {
 
   const choice = data?.choices?.[0];
   const assistantText = normalizeAssistantText(choice?.message?.content, payload);
-  const finalReply = stripProviderIdentity(assistantText || buildFallbackReply(payload));
+  const finalReply = assistantText || '我在，继续说。';
 
   return {
     reply: finalReply,
@@ -2257,15 +2514,22 @@ async function chatWithDeepSeek(payload) {
 
 async function saveUserMessage(pb, userId, message, model, imageDataUrl, sequence = null) {
   const storedText = encodeStoredChatText(message, sequence);
-  const legacyPayload = {
+  const fallbackPayload = {
+    user: userId,
+    appId: PB_APP_ID,
+    role: 'user',
+    text: storedText,
+    model,
+    ...buildAuditCreateFields(userId),
+  };
+  const minimalPayload = {
     user: userId,
     role: 'user',
     text: storedText,
     model,
   };
   const strictPayload = {
-    ...legacyPayload,
-    ...buildAuditCreateFields(userId),
+    ...fallbackPayload,
   };
 
   if (!imageDataUrl) {
@@ -2273,7 +2537,12 @@ async function saveUserMessage(pb, userId, message, model, imageDataUrl, sequenc
       return await pb.collection(PB_CHAT_COLLECTION).create(strictPayload);
     } catch (error) {
       if (!isRecoverableMemoryWriteError(error)) throw error;
-      return pb.collection(PB_CHAT_COLLECTION).create(legacyPayload);
+      try {
+        return await pb.collection(PB_CHAT_COLLECTION).create(fallbackPayload);
+      } catch (fallbackError) {
+        if (!isRecoverableMemoryWriteError(fallbackError)) throw fallbackError;
+        return pb.collection(PB_CHAT_COLLECTION).create(minimalPayload);
+      }
     }
   }
 
@@ -2283,7 +2552,12 @@ async function saveUserMessage(pb, userId, message, model, imageDataUrl, sequenc
       return await pb.collection(PB_CHAT_COLLECTION).create(strictPayload);
     } catch (error) {
       if (!isRecoverableMemoryWriteError(error)) throw error;
-      return pb.collection(PB_CHAT_COLLECTION).create(legacyPayload);
+      try {
+        return await pb.collection(PB_CHAT_COLLECTION).create(fallbackPayload);
+      } catch (fallbackError) {
+        if (!isRecoverableMemoryWriteError(fallbackError)) throw fallbackError;
+        return pb.collection(PB_CHAT_COLLECTION).create(minimalPayload);
+      }
     }
   }
 
@@ -2302,11 +2576,25 @@ async function saveUserMessage(pb, userId, message, model, imageDataUrl, sequenc
     if (!isRecoverableMemoryWriteError(error)) throw error;
     const fallback = new FormData();
     fallback.append('user', userId);
+    fallback.append('appId', PB_APP_ID);
     fallback.append('role', 'user');
     fallback.append('text', storedText);
     fallback.append('model', model);
+    fallback.append('createdBy', userId);
+    fallback.append('updatedBy', userId);
     fallback.append('image', upload.blob, upload.filename);
-    return pb.collection(PB_CHAT_COLLECTION).create(fallback);
+    try {
+      return await pb.collection(PB_CHAT_COLLECTION).create(fallback);
+    } catch (fallbackError) {
+      if (!isRecoverableMemoryWriteError(fallbackError)) throw fallbackError;
+      const minimal = new FormData();
+      minimal.append('user', userId);
+      minimal.append('role', 'user');
+      minimal.append('text', storedText);
+      minimal.append('model', model);
+      minimal.append('image', upload.blob, upload.filename);
+      return pb.collection(PB_CHAT_COLLECTION).create(minimal);
+    }
   }
 }
 
@@ -2323,36 +2611,179 @@ async function saveAssistantMessage(pb, userId, message, model, sequence = null)
     return await pb.collection(PB_CHAT_COLLECTION).create(strictPayload);
   } catch (error) {
     if (!isRecoverableMemoryWriteError(error)) throw error;
-    return pb.collection(PB_CHAT_COLLECTION).create({
+    const fallback = {
       user: userId,
+      appId: PB_APP_ID,
       role: 'assistant',
       text: storedText,
       model,
-    });
+      ...buildAuditCreateFields(userId),
+    };
+    try {
+      return await pb.collection(PB_CHAT_COLLECTION).create(fallback);
+    } catch (fallbackError) {
+      if (!isRecoverableMemoryWriteError(fallbackError)) throw fallbackError;
+      return pb.collection(PB_CHAT_COLLECTION).create({
+        user: userId,
+        role: 'assistant',
+        text: storedText,
+        model,
+      });
+    }
   }
+}
+
+function normalizeRecapList(items, limit = 4) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .filter((item, index, arr) => arr.indexOf(item) === index)
+    .slice(0, limit);
+}
+
+function safeParseJsonObject(raw) {
+  try {
+    const parsed = JSON.parse(String(raw || '').trim());
+    if (parsed && typeof parsed === 'object') return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function buildRecapFallback(period, label, startDate, endDate, messages) {
+  const userTexts = (messages || [])
+    .filter((item) => item.role === 'user')
+    .map((item) => String(item.text || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  return {
+    id: `recap-${period}-${label}`,
+    period,
+    label,
+    startDate,
+    endDate,
+    summary: userTexts.length > 0 ? `本周期共${messages.length}条对话，重点围绕：${userTexts.slice(-3).join('；').slice(0, 120)}` : '本周期对话较少，建议继续记录。',
+    highlights: normalizeRecapList(userTexts.slice(-3), 3),
+    lowlights: [],
+    actions: userTexts.length > 0 ? ['把上面最关键的一件事拆成下一步'] : [],
+    milestones: [],
+    growths: [],
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function sanitizeRecapOutput(period, label, startDate, endDate, parsed, fallbackRecap) {
+  const summaryRaw = String(parsed?.summary || '').replace(/\s+/g, ' ').trim();
+  const summary = summaryRaw.length >= 30 ? summaryRaw.slice(0, 480) : fallbackRecap.summary;
+  const highlights = normalizeRecapList(parsed?.highlights, 4);
+  const actions = normalizeRecapList(parsed?.actions, 4);
+  const milestones = normalizeRecapList(parsed?.milestones, 3);
+  const growths = normalizeRecapList(parsed?.growths, 3);
+
+  return {
+    id: `recap-${period}-${label}`,
+    period,
+    label,
+    startDate,
+    endDate,
+    summary,
+    highlights: highlights.length > 0 ? highlights : fallbackRecap.highlights,
+    lowlights: [],
+    actions: actions.length > 0 ? actions : fallbackRecap.actions,
+    milestones,
+    growths,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+async function generateRecapFromMessages(input) {
+  const { period, label, startDate, endDate, messages } = input;
+  const fallbackRecap = buildRecapFallback(period, label, startDate, endDate, messages);
+  const transcript = (messages || [])
+    .slice(-80)
+    .map((item, index) => {
+      const id = String(item.id || `m-${index + 1}`);
+      const role = item.role === 'assistant' ? 'assistant' : 'user';
+      const text = String(item.text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+      return `[${id}](${role}) ${text}`;
+    })
+    .filter((line) => line.trim().length > 0)
+    .join('\n');
+
+  if (!transcript.trim()) {
+    return fallbackRecap;
+  }
+
+  const body = {
+    model: DEEPSEEK_TEXT_MODEL,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          '你是复盘引擎。严格输出 JSON，不要 markdown，不要额外解释。',
+          'JSON schema:',
+          '{"summary":"string","highlights":["string"],"actions":["string"],"milestones":["string"],"growths":["string"]}',
+          '要求：summary 80-220字；highlights/actions 各1-4条；milestones/growths 各0-3条。',
+          '只基于对话内容，不编造。',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: `周期=${period}; 标签=${label}; 起止=${startDate}~${endDate}\n对话:\n${transcript}`,
+      },
+    ],
+    temperature: 0.2,
+    max_tokens: 1200,
+    stream: false,
+  };
+
+  const { response, data } = await fetchJsonWithTimeout(
+    DEEPSEEK_CHAT_URL,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    },
+    MODEL_TIMEOUT_MS,
+  );
+
+  if (!response.ok) {
+    return fallbackRecap;
+  }
+
+  const choice = data?.choices?.[0];
+  const raw = typeof choice?.message?.content === 'string' ? choice.message.content : '';
+  const parsed = safeParseJsonObject(raw);
+  if (!parsed) {
+    return fallbackRecap;
+  }
+
+  return sanitizeRecapOutput(period, label, startDate, endDate, parsed, fallbackRecap);
 }
 
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
+    version: APP_VERSION,
     hasDeepseekKey: Boolean(DEEPSEEK_API_KEY),
     textProvider: 'deepseek',
     pocketbase: {
       configured: Boolean(PB_URL),
-      url: PB_URL || '',
       usersCollection: PB_USERS_COLLECTION,
       chatCollection: PB_CHAT_COLLECTION,
       memoriesCollection: PB_MEMORIES_COLLECTION,
       userAppsCollection: PB_USER_APPS_COLLECTION,
       appId: PB_APP_ID,
-      appIdWhitelist: PB_APP_ID_WHITELIST,
     },
     vector: {
       enabled: isVectorConfigured(),
       provider: 'qdrant',
       embedding: 'local-hash',
       configured: Boolean(QDRANT_URL),
-      collection: QDRANT_COLLECTION,
       dimension: VECTOR_DIM,
       topK: VECTOR_TOP_K,
       backoffUntil: vectorBackoffUntil || null,
@@ -2364,14 +2795,102 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+app.get('/api/version', (req, res) => {
+  return res.json({
+    version: APP_VERSION,
+    gitSha: DEPLOY_GIT_SHA,
+    imageDigest: DEPLOY_IMAGE_DIGEST,
+    buildTime: BUILD_TIME,
+    requestId: req.requestId || '',
+    now: new Date().toISOString(),
+  });
+});
+
+app.get('/api/ops/metrics', (req, res) => {
+  if (!hasOpsMetricsAccess(req)) {
+    return sendApiError(req, res, OPS_METRICS_KEY ? 403 : 404, OPS_METRICS_KEY ? 'ops access forbidden' : 'not found', OPS_METRICS_KEY ? 'ACCESS_BLOCKED' : 'NOT_FOUND');
+  }
+
+  const routeEntries = Object.entries(apiMetrics.byRoute)
+    .map(([route, value]) => ({
+      route,
+      count: Number(value.count || 0),
+      errors: Number(value.errors || 0),
+      avgMs: Number(value.count || 0) > 0 ? Math.round(Number(value.totalMs || 0) / Number(value.count || 1)) : 0,
+      maxMs: Number(value.maxMs || 0),
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 30);
+
+  return res.json({
+    startedAt: apiMetrics.startedAt,
+    now: new Date().toISOString(),
+    totalRequests: apiMetrics.totalRequests,
+    totalErrors: apiMetrics.totalErrors,
+    errorRate: apiMetrics.totalRequests > 0 ? Number((apiMetrics.totalErrors / apiMetrics.totalRequests).toFixed(4)) : 0,
+    byStatus: apiMetrics.byStatus,
+    byErrorCode: apiMetrics.byErrorCode,
+    topRoutes: routeEntries,
+  });
+});
+
+app.post('/api/recap/generate', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return sendApiError(req, res, 401, 'missing bearer token');
+    }
+    const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return sendApiError(req, res, 403, 'app access blocked');
+    }
+
+    const period = String(req.body?.period || '').trim();
+    const label = String(req.body?.label || '').trim();
+    const startDate = String(req.body?.startDate || '').trim();
+    const endDate = String(req.body?.endDate || '').trim();
+    const incoming = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const messages = incoming
+      .map((item, index) => ({
+        id: String(item?.id || `m-${index + 1}`),
+        role: item?.role === 'assistant' ? 'assistant' : 'user',
+        text: String(item?.text || ''),
+        createdAt: String(item?.createdAt || ''),
+      }))
+      .filter((item) => item.text.trim().length > 0)
+      .slice(-120);
+
+    if (!['day', 'week', 'month', 'year'].includes(period)) {
+      return sendApiError(req, res, 400, 'invalid recap period', 'VALIDATION_INVALID_RECAP_PERIOD');
+    }
+    if (!label || !startDate || !endDate) {
+      return sendApiError(req, res, 400, 'recap label/startDate/endDate are required', 'VALIDATION_RECAP_RANGE_REQUIRED');
+    }
+    if (messages.length === 0) {
+      return sendApiError(req, res, 400, 'recap messages are required', 'VALIDATION_RECAP_MESSAGES_REQUIRED');
+    }
+
+    const recap = await generateRecapFromMessages({ period, label, startDate, endDate, messages });
+    return res.json({ recap });
+  } catch (error) {
+    const message = error?.response?.message || error?.message || 'recap generate failed';
+    return sendApiError(req, res, statusForApiError(message), message);
+  }
+});
+
 app.post('/api/auth/register', async (req, res) => {
   try {
+    const registerIp = `register:${getClientIp(req)}`;
+    if (enforceRateLimit(req, res, registerRateLimit, registerIp, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_REGISTER_MAX, 'auth-register-ip')) {
+      return;
+    }
+
     const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'email and password are required' });
+      return sendApiError(req, res, 400, 'email and password are required', 'VALIDATION_MISSING_CREDENTIALS');
     }
 
     const pb = createPb();
@@ -2413,39 +2932,42 @@ app.post('/api/auth/register', async (req, res) => {
     const passwordMessage = pbData?.password?.message || '';
 
     if (emailCode === 'validation_not_unique') {
-      return res.status(409).json({ error: '该邮箱已注册，请直接登录' });
+      return sendApiError(req, res, 409, '该邮箱已注册，请直接登录', 'AUTH_EMAIL_EXISTS');
     }
 
     if (emailCode === 'validation_invalid_email') {
-      return res.status(400).json({ error: '邮箱格式不正确' });
+      return sendApiError(req, res, 400, '邮箱格式不正确', 'VALIDATION_INVALID_EMAIL');
     }
 
     if (
       passwordCode === 'validation_length_out_of_range'
       || /8|72|min|between/i.test(String(passwordMessage || ''))
     ) {
-      return res.status(400).json({ error: '密码至少 8 位' });
+      return sendApiError(req, res, 400, '密码至少 8 位', 'VALIDATION_WEAK_PASSWORD');
     }
 
     if (/unique/i.test(String(emailMessage || ''))) {
-      return res.status(409).json({ error: '该邮箱已注册，请直接登录' });
+      return sendApiError(req, res, 409, '该邮箱已注册，请直接登录', 'AUTH_EMAIL_EXISTS');
     }
 
     const message = error?.response?.message || error?.message || 'register failed';
     const timeout = /timeout/i.test(String(message));
-    return res.status(timeout ? 504 : 400).json({
-      error: timeout ? `pocketbase request timeout: ${message}` : message,
-    });
+    return sendApiError(req, res, timeout ? 504 : 400, timeout ? `pocketbase request timeout: ${message}` : message);
   }
 });
 
 app.post('/api/auth/login', async (req, res) => {
   try {
+    const loginIp = `login:${getClientIp(req)}`;
+    if (enforceRateLimit(req, res, loginRateLimit, loginIp, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_LOGIN_MAX, 'auth-login-ip')) {
+      return;
+    }
+
     const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'email and password are required' });
+      return sendApiError(req, res, 400, 'email and password are required', 'VALIDATION_MISSING_CREDENTIALS');
     }
 
     const pb = createPb();
@@ -2471,9 +2993,7 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (error) {
     const message = error?.response?.message || error?.message || 'login failed';
     const timeout = /timeout/i.test(String(message));
-    return res.status(timeout ? 504 : 401).json({
-      error: timeout ? `pocketbase request timeout: ${message}` : message,
-    });
+    return sendApiError(req, res, timeout ? 504 : 401, timeout ? `pocketbase request timeout: ${message}` : message);
   }
 });
 
@@ -2481,12 +3001,12 @@ app.get('/api/auth/me', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
 
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     return res.json({
       token: auth.token,
@@ -2502,7 +3022,7 @@ app.get('/api/auth/me', async (req, res) => {
     });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'invalid token';
-    return res.status(401).json({ error: message });
+    return sendApiError(req, res, 401, message);
   }
 });
 
@@ -2510,7 +3030,7 @@ app.get('/api/history', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
 
     const limitRaw = Number(req.query.limit || 120);
@@ -2518,7 +3038,7 @@ app.get('/api/history', async (req, res) => {
 
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     const list = await listUserChatRecords(auth.pb, auth.user.id, 1, limit);
 
@@ -2533,7 +3053,7 @@ app.get('/api/history', async (req, res) => {
     });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'history failed';
-    return res.status(400).json({ error: message });
+    return sendApiError(req, res, statusForApiError(message), message);
   }
 });
 
@@ -2541,18 +3061,18 @@ app.post('/api/history/delete', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
 
     const incoming = Array.isArray(req.body?.ids) ? req.body.ids : [];
     const ids = Array.from(new Set(incoming.map((item) => String(item || '').trim()).filter(Boolean))).slice(0, 100);
     if (ids.length === 0) {
-      return res.status(400).json({ error: 'ids is required' });
+      return sendApiError(req, res, 400, 'ids is required', 'VALIDATION_IDS_REQUIRED');
     }
 
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     let deleted = 0;
     let notOwned = 0;
@@ -2594,7 +3114,7 @@ app.post('/api/history/delete', async (req, res) => {
     return res.json({ deleted, notOwned, notFound });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'history delete failed';
-    return res.status(400).json({ error: message });
+    return sendApiError(req, res, statusForApiError(message), message);
   }
 });
 
@@ -2602,12 +3122,12 @@ app.post('/api/history/clear', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
 
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     const ids = [];
     const pageSize = 200;
@@ -2644,7 +3164,109 @@ app.post('/api/history/clear', async (req, res) => {
     return res.json({ deleted, vectorCleared });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'history clear failed';
-    return res.status(400).json({ error: message });
+    return sendApiError(req, res, statusForApiError(message), message);
+  }
+});
+
+app.post('/api/context/reset', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return sendApiError(req, res, 401, 'missing bearer token');
+    }
+
+    const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return sendApiError(req, res, 403, 'app access blocked');
+    }
+
+    const chatIds = [];
+    const pageSize = 200;
+    let page = 1;
+    for (let guard = 0; guard < 30; guard += 1) {
+      const list = await withTimeout(
+        listUserChatRecords(auth.pb, auth.user.id, page, pageSize),
+        POCKETBASE_TIMEOUT_MS,
+        'context reset list chat',
+      );
+
+      const batch = Array.isArray(list?.items)
+        ? list.items.map((item) => item.id).filter(Boolean)
+        : [];
+      chatIds.push(...batch);
+
+      const totalPages = Number(list?.totalPages || 1);
+      if (page >= totalPages) break;
+      page += 1;
+    }
+
+    let chatDeleted = 0;
+    for (const id of chatIds) {
+      await withTimeout(
+        auth.pb.collection(PB_CHAT_COLLECTION).delete(id),
+        POCKETBASE_TIMEOUT_MS,
+        'context reset delete chat',
+      );
+      chatDeleted += 1;
+    }
+
+    let memoryDeleted = 0;
+    try {
+      let memPage = 1;
+      for (let guard = 0; guard < 30; guard += 1) {
+        let list = null;
+        try {
+          list = await withTimeout(
+            auth.pb.collection(PB_MEMORIES_COLLECTION).getList(memPage, 200, {
+              filter: buildUserAppFilter(auth.user.id, true),
+            }),
+            POCKETBASE_TIMEOUT_MS,
+            'context reset list memories with appId',
+          );
+        } catch (error) {
+          if (!isFilterFieldError(error)) throw error;
+          list = await withTimeout(
+            auth.pb.collection(PB_MEMORIES_COLLECTION).getList(memPage, 200, {
+              filter: buildUserAppFilter(auth.user.id, false),
+            }),
+            POCKETBASE_TIMEOUT_MS,
+            'context reset list memories fallback',
+          );
+        }
+
+        const items = Array.isArray(list?.items) ? list.items : [];
+        for (const item of items) {
+          await withTimeout(
+            auth.pb.collection(PB_MEMORIES_COLLECTION).delete(item.id),
+            POCKETBASE_TIMEOUT_MS,
+            'context reset delete memory',
+          );
+          memoryDeleted += 1;
+        }
+
+        const totalPages = Number(list?.totalPages || 1);
+        if (memPage >= totalPages) break;
+        memPage += 1;
+      }
+    } catch (error) {
+      if (!isMissingCollectionError(error)) {
+        throw error;
+      }
+    }
+
+    const emptyState = normalizeStatePayload({});
+    await saveState(auth.pb, auth.user.id, emptyState);
+    const vectorCleared = await clearVectorMemoriesForUser(auth.user.id);
+
+    return res.json({
+      chatDeleted,
+      memoryDeleted,
+      vectorCleared,
+      stateReset: true,
+    });
+  } catch (error) {
+    const message = error?.response?.message || error?.message || 'context reset failed';
+    return sendApiError(req, res, statusForApiError(message), message);
   }
 });
 
@@ -2652,11 +3274,11 @@ app.get('/api/identity', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     const found = await readIdentity(auth.pb, auth.user.id);
     return res.json({
@@ -2664,7 +3286,7 @@ app.get('/api/identity', async (req, res) => {
     });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'identity fetch failed';
-    return res.status(400).json({ error: message });
+    return sendApiError(req, res, statusForApiError(message), message);
   }
 });
 
@@ -2672,18 +3294,18 @@ app.post('/api/identity', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     const identity = normalizeIdentity(req.body || {});
     await saveIdentity(auth.pb, auth.user.id, identity);
     return res.json({ identity });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'identity save failed';
-    return res.status(400).json({ error: message });
+    return sendApiError(req, res, statusForApiError(message), message);
   }
 });
 
@@ -2691,17 +3313,17 @@ app.get('/api/state', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     const state = await readState(auth.pb, auth.user.id);
     return res.json({ state: state || null });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'state fetch failed';
-    return res.status(400).json({ error: message });
+    return sendApiError(req, res, statusForApiError(message), message);
   }
 });
 
@@ -2709,23 +3331,23 @@ app.post('/api/state', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     const state = normalizeStatePayload(req.body?.state || req.body || {});
     const text = stateToText(state);
     if (text.length > 900000) {
-      return res.status(400).json({ error: 'state payload too large' });
+      return sendApiError(req, res, 400, 'state payload too large', 'VALIDATION_PAYLOAD_TOO_LARGE');
     }
 
     await saveState(auth.pb, auth.user.id, state);
     return res.json({ state });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'state save failed';
-    return res.status(400).json({ error: message });
+    return sendApiError(req, res, statusForApiError(message), message);
   }
 });
 
@@ -2733,12 +3355,12 @@ app.get('/api/memories', async (req, res) => {
   try {
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
     }
 
     const auth = await authByToken(token);
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
     }
     const limitRaw = Number(req.query.limit || 50);
     const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(limitRaw, 200)) : 50;
@@ -2772,7 +3394,7 @@ app.get('/api/memories', async (req, res) => {
     }
   } catch (error) {
     const message = error?.response?.message || error?.message || 'memories fetch failed';
-    return res.status(400).json({ error: message });
+    return sendApiError(req, res, statusForApiError(message), message);
   }
 });
 
@@ -2790,7 +3412,12 @@ app.post('/api/chat', async (req, res) => {
 
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: 'missing bearer token' });
+      return sendApiError(req, res, 401, 'missing bearer token');
+    }
+
+    const chatIp = `chat-ip:${getClientIp(req)}`;
+    if (enforceRateLimit(req, res, chatIpRateLimit, chatIp, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_CHAT_IP_MAX, 'chat-ip')) {
+      return;
     }
 
     let auth = null;
@@ -2800,10 +3427,15 @@ app.post('/api/chat', async (req, res) => {
       checkpoint('authMs', authStarted);
     } catch (error) {
       const message = error?.response?.message || error?.message || 'invalid token';
-      return res.status(401).json({ error: message });
+      return sendApiError(req, res, 401, message);
     }
     if (!hasAppAccess(auth)) {
-      return res.status(403).json({ error: 'app access blocked' });
+      return sendApiError(req, res, 403, 'app access blocked');
+    }
+
+    const chatUser = `chat-user:${auth.user.id}`;
+    if (enforceRateLimit(req, res, chatUserRateLimit, chatUser, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_CHAT_USER_MAX, 'chat-user')) {
+      return;
     }
 
     const payload = req.body || {};
@@ -2811,15 +3443,11 @@ app.post('/api/chat', async (req, res) => {
     const imageDataUrl = typeof payload.imageDataUrl === 'string' ? payload.imageDataUrl.trim() : '';
 
     if (!message && !imageDataUrl) {
-      return res.status(400).json({ error: 'message or imageDataUrl is required' });
+      return sendApiError(req, res, 400, 'message or imageDataUrl is required', 'VALIDATION_CHAT_INPUT_REQUIRED');
     }
     if (imageDataUrl && !imageDataUrl.startsWith('data:image/')) {
-      return res.status(400).json({ error: 'imageDataUrl must be data:image/* base64' });
+      return sendApiError(req, res, 400, 'imageDataUrl must be data:image/* base64', 'VALIDATION_IMAGE_DATA_URL');
     }
-    if (isInternalRecapPrompt(message)) {
-      return res.status(400).json({ error: 'internal recap prompt is not allowed on chat endpoint' });
-    }
-
     const directReply = '';
     if (directReply) {
       const persistStarted = Date.now();
@@ -2888,6 +3516,7 @@ app.post('/api/chat', async (req, res) => {
         : [],
       todayJournal: payload.todayJournal || null,
       identity: payload.identity || null,
+      recapRecords: Array.isArray(payload.recapRecords) ? payload.recapRecords : [],
       recentMessages: mergedRecentMessages,
     };
     const modelStarted = Date.now();
@@ -2920,27 +3549,48 @@ app.post('/api/chat', async (req, res) => {
 
     return res.json(responseBody);
   } catch (error) {
-    const status = Number(error.status || 502);
+    const status = Number(error?.status || error?.response?.status || 0);
+    const finalStatus = status >= 400 && status < 600 ? status : 500;
     const message = error?.response?.message || error?.message || 'chat failed';
-    return res.status(status).json({ error: message });
+    return sendApiError(req, res, finalStatus, message);
   }
 });
 
+if (process.listenerCount('unhandledRejection') === 0) {
+  process.on('unhandledRejection', (reason) => {
+    logEvent('error', 'process-unhandled-rejection', {
+      reason: reason instanceof Error ? reason.message : String(reason || ''),
+    });
+  });
+}
+
+if (process.listenerCount('uncaughtException') === 0) {
+  process.on('uncaughtException', (error) => {
+    logEvent('error', 'process-uncaught-exception', {
+      error: error instanceof Error ? error.message : String(error || ''),
+    });
+  });
+}
+
 if (!process.env.VERCEL) {
   app.listen(PORT, () => {
-    console.log(`[growup-server] listening on http://localhost:${PORT}`);
-    console.log(
-      `[growup-server] deepseek=${DEEPSEEK_API_KEY ? 'configured' : 'missing'} text=${DEEPSEEK_TEXT_MODEL} vision=${DEEPSEEK_VISION_MODEL}`,
-    );
-    console.log(
-      `[growup-server] response-control maxTokens=${MODEL_MAX_TOKENS} safety=minimal`,
-    );
-    console.log(
-      `[growup-server] pocketbase=${PB_URL ? PB_URL : 'missing'} users=${PB_USERS_COLLECTION} chats=${PB_CHAT_COLLECTION} memories=${PB_MEMORIES_COLLECTION} userApps=${PB_USER_APPS_COLLECTION} appId=${PB_APP_ID}`,
-    );
-    console.log(
-      `[growup-server] vector=${isVectorConfigured() ? 'enabled' : 'disabled'} qdrant=${QDRANT_URL ? 'configured' : 'missing'} collection=${QDRANT_COLLECTION} dim=${VECTOR_DIM} topK=${VECTOR_TOP_K}`,
-    );
+    logEvent('info', 'server-started', {
+      port: PORT,
+      deepseekConfigured: Boolean(DEEPSEEK_API_KEY),
+      textModel: DEEPSEEK_TEXT_MODEL,
+      visionModel: DEEPSEEK_VISION_MODEL,
+      maxTokens: MODEL_MAX_TOKENS,
+      pocketbaseConfigured: Boolean(PB_URL),
+      usersCollection: PB_USERS_COLLECTION,
+      chatCollection: PB_CHAT_COLLECTION,
+      memoriesCollection: PB_MEMORIES_COLLECTION,
+      userAppsCollection: PB_USER_APPS_COLLECTION,
+      appId: PB_APP_ID,
+      vectorEnabled: isVectorConfigured(),
+      qdrantConfigured: Boolean(QDRANT_URL),
+      vectorDimension: VECTOR_DIM,
+      vectorTopK: VECTOR_TOP_K,
+    });
   });
 }
 
