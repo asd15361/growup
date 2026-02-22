@@ -1,6 +1,6 @@
 {
   "name": "growup",
-  "version": "1.19.13",
+  "version": "1.19.14",
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
