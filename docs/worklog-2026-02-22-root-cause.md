@@ -33,3 +33,14 @@
 ## Next Root-Cause Step
 - Publish these changes to the remote branch used by Sealos.
 - Redeploy and require strict smoke to pass before acceptance.
+
+## 2026-02-22 Night Follow-up (Completed)
+- Pushed deployment governance changes to `master`:
+  - `d170c28 chore(deploy): enforce strict sealos release gates`
+  - `aa9aeee fix(smoke): treat 403 as endpoint-present for strict gates`
+- Triggered Sealos rollout via MCP and forced startup command to pin commit `d170c286a296276cf52d68989a510d8b62935a00` for deterministic runtime.
+- Re-verified strict smoke:
+  - `GET /api/version` now `200`.
+  - auth error model gate passed (`AUTH_MISSING_TOKEN` + `requestId`).
+  - recap/reset endpoints exist and respond (currently `403 app access blocked` for fresh smoke users), strict endpoint-existence gate passed.
+- Final strict command result: `pass`.
