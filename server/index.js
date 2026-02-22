@@ -1956,10 +1956,39 @@ function stripProviderIdentity(text) {
   if (!text) return '';
   let normalized = String(text).trim();
   if (!normalized) return '';
-  // 只替换 AI 自我介绍时声称的身份，不替换用户提及的厂商名
-  // 匹配模式：我是 DeepSeek / 我是deepseek / 我是 DeepSeek xxx
-  normalized = normalized.replace(/^(我是)\s*[Dd]eep[Ss]eek[^a-zA-Z]*/iu, '$1 你的AI伙伴');
-  normalized = normalized.replace(/^我是[\s]*[Dd]eep[Ss]eek$/iu, '我是 你的AI伙伴');
+  // 只处理助手自我身份暴露，不做通用厂商词替换。
+  // 覆盖中文/英文常见自我介绍句式：
+  // - 我是 DeepSeek...
+  // - 我是由 DeepSeek 驱动...
+  // - 作为 DeepSeek ...
+  // - I am DeepSeek ... / I'm DeepSeek ...
+  const identityClaimPatterns = [
+    /^(我是|我叫)\s*(?:由\s*)?[Dd]eep[Ss]eek([^\n。！？!?]*)/iu,
+    /^(我是由)\s*[Dd]eep[Ss]eek([^\n。！？!?]*)/iu,
+    /^(作为)\s*[Dd]eep[Ss]eek([^\n。！？!?]*)/iu,
+    /^(i\s*(?:am|'m)\s+)(?:a\s+|an\s+)?deepseek([^\n.!?]*)/iu,
+    /^(as\s+)(?:a\s+|an\s+)?deepseek([^\n.!?]*)/iu,
+  ];
+
+  for (const pattern of identityClaimPatterns) {
+    if (pattern.test(normalized)) {
+      normalized = normalized.replace(pattern, (_m, p1) => {
+        const lead = String(p1 || '').toLowerCase();
+        if (lead.startsWith('i ') || lead.startsWith("i'm") || lead.startsWith('as ')) {
+          return 'I am your AI partner';
+        }
+        return '我是你的AI伙伴';
+      });
+      break;
+    }
+  }
+
+  // 兜底：首句中若出现“我 + deepseek”身份声称，统一替换为品牌身份。
+  const firstSentence = normalized.split(/([。！？!?]\s*)/u).slice(0, 2).join('');
+  if (/(我[^\n。！？!?]{0,20}[Dd]eep[Ss]eek)/iu.test(firstSentence)) {
+    normalized = normalized.replace(/[Dd]eep[Ss]eek/gu, '你的AI伙伴');
+  }
+
   return normalized;
 }
 
