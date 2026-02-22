@@ -1953,9 +1953,14 @@ function normalizeAssistantText(content, payload) {
 }
 
 function stripProviderIdentity(text) {
-  const normalized = String(text || '').trim();
+  if (!text) return '';
+  let normalized = String(text).trim();
   if (!normalized) return '';
-  return normalized.replace(/deepseek/giu, 'gimini 3.0pro');
+  // 只替换 AI 自我介绍时声称的身份，不替换用户提及的厂商名
+  // 匹配模式：我是 DeepSeek / 我是deepseek / 我是 DeepSeek xxx
+  normalized = normalized.replace(/^(我是)\s*[Dd]eep[Ss]eek[^a-zA-Z]*/iu, '$1 你的AI伙伴');
+  normalized = normalized.replace(/^我是[\s]*[Dd]eep[Ss]eek$/iu, '我是 你的AI伙伴');
+  return normalized;
 }
 
 function stripMarkdownBold(text) {
