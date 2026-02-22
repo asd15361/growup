@@ -1085,7 +1085,7 @@ async function persistChatWithTimeout(auth, message, imageDataUrl, modelResult) 
   const runPersist = async () => {
     const turnBase = nextTurnSequenceBase();
     const savedUser = await withTimeout(
-      saveUserMessage(auth.pb, auth.user.id, message || '[图片]', modelResult.model, imageDataUrl, turnBase + 1),
+      saveUserMessage(auth.pb, auth.user.id, message || '[\u56fe\u7247]', modelResult.model, imageDataUrl, turnBase + 1),
       POCKETBASE_TIMEOUT_MS,
       'persist user message',
     );
@@ -1099,8 +1099,10 @@ async function persistChatWithTimeout(auth, message, imageDataUrl, modelResult) 
         createdAt: savedUser?.created || new Date().toISOString(),
       });
     }
+
+    const safeAssistantReply = sanitizeAssistantReply(modelResult?.reply || '') || '\u6211\u5728\uff0c\u7ee7\u7eed\u8bf4\u3002';
     await withTimeout(
-      saveAssistantMessage(auth.pb, auth.user.id, modelResult.reply, modelResult.model, turnBase + 2),
+      saveAssistantMessage(auth.pb, auth.user.id, safeAssistantReply, modelResult.model, turnBase + 2),
       POCKETBASE_TIMEOUT_MS,
       'persist assistant message',
     );
@@ -1774,12 +1776,17 @@ function normalizeRecentMessages(items, limit = 12) {
 
   for (const item of items) {
     const role = item && item.role === 'assistant' ? 'assistant' : 'user';
-    const text = typeof item?.text === 'string' ? item.text.replace(/\s+/g, ' ').trim() : '';
+    let text = typeof item?.text === 'string' ? item.text.replace(/\s+/g, ' ').trim() : '';
     if (!text) continue;
-    if (text === '正在输入...') continue;
-    if (text.startsWith('网络失败：')) continue;
+    if (text === '\u6b63\u5728\u8f93\u5165...') continue;
+    if (text.startsWith('\u7f51\u7edc\u5931\u8d25\uff1a')) continue;
     if (looksLikeInternalArtifact(text)) continue;
-    if (role === 'assistant' && isUnsafeAssistantStyle(text)) continue;
+
+    if (role === 'assistant') {
+      text = sanitizeAssistantReply(stripLeadingStageDirections(text));
+      if (!text) continue;
+      if (isUnsafeAssistantStyle(text)) continue;
+    }
 
     const clipped = text.slice(0, 600);
     const prev = next[next.length - 1];
@@ -1805,10 +1812,14 @@ async function loadRecentMessagesForModel(pb, userId, limit = 12) {
         .filter((item) => !isSystemMessageRecord(item)),
     );
     const normalized = timeline
-      .map((item) => ({
-        role: item.role === 'assistant' ? 'assistant' : 'user',
-        text: parseStoredChatText(item.text).text,
-      }));
+      .map((item) => {
+        const role = item.role === 'assistant' ? 'assistant' : 'user';
+        const parsedText = parseStoredChatText(item.text).text;
+        return {
+          role,
+          text: role === 'assistant' ? sanitizeAssistantReply(parsedText) : parsedText,
+        };
+      });
     return normalizeRecentMessages(normalized, limit);
   } catch {
     return [];
@@ -1849,8 +1860,15 @@ function detectResponseMode(payload) {
 }
 
 function buildSystemPrompt(identity) {
-  return '';
+  const profile = normalizeIdentity(identity);
+  return [
+    `\u4f60\u662f${profile.companionName}\uff0c\u6b63\u5728\u548c\u7528\u6237${profile.userName}\u804a\u5929\u3002`,
+    '\u4f60\u662f\u4e00\u4e2a\u4f1a\u5e2e\u52a9\u7528\u6237\u6210\u957f\u3001\u5e76\u5e2e\u52a9\u7528\u6237\u590d\u76d8\u7684AI\u4f19\u4f34\u3002',
+    '\u4e0d\u8981\u81ea\u79f0\u6216\u6697\u793a\u81ea\u5df1\u662f\u4efb\u4f55\u5382\u5546\u6216\u4ea7\u54c1\uff08\u5305\u62ec DeepSeek\uff09\u3002',
+    '\u5f53\u7528\u6237\u8be2\u95ee\u201c\u4f60\u662f\u8c01/\u4f60\u662f\u4ec0\u4e48\u6a21\u578b\u201d\u65f6\uff0c\u53ea\u6309\u4f19\u4f34\u8eab\u4efd\u56de\u7b54\uff0c\u4e0d\u8981\u63d0\u53ca\u5382\u5546\u540d\u3002',
+  ].join('\n');
 }
+
 
 function buildMemoryHintText(payload) {
   const memories = Array.isArray(payload.relevantMemories)
@@ -1989,7 +2007,28 @@ function stripProviderIdentity(text) {
     normalized = normalized.replace(/[Dd]eep[Ss]eek/gu, '你的AI伙伴');
   }
 
+  // 更宽松的兜底：覆盖 deep seek / deep-seek / deep sick 等变体，
+  // 仅当文本前两句出现“自我身份语气”时触发，避免误伤普通知识解释。
+  const firstTwoSentences = normalized.split(/([。！？!?]\s*)/u).slice(0, 4).join('');
+  const hasSelfIdentityTone = /(我|我是|我叫|作为|本助手|本模型|i\s*(?:am|'m)|as\s+(?:an?\s+)?(?:ai|model)|this\s+(?:assistant|model))/iu.test(firstTwoSentences);
+  const providerVariant = /(deep\s*[-_ ]?\s*seek|deep\s*[-_ ]?\s*sick)/iu;
+  if (hasSelfIdentityTone && providerVariant.test(firstTwoSentences)) {
+    normalized = normalized
+      .replace(/deep\s*[-_ ]?\s*seek/giu, '你的AI伙伴')
+      .replace(/deep\s*[-_ ]?\s*sick/giu, '你的AI伙伴');
+  }
+
+  // 避免出现“我不是你的AI伙伴”这类替换后反语义句子。
+  normalized = normalized
+    .replace(/^我不(?:是|叫)\s*你的AI伙伴[^\n。！？!?]*/u, '我是你的AI伙伴')
+    .replace(/^i\s*(?:am|'m)\s+not\s+your\s+ai\s+partner[^\n.!?]*/iu, 'I am your AI partner');
+
   return normalized;
+}
+
+function sanitizeAssistantReply(text) {
+  if (!text) return '';
+  return stripProviderIdentity(stripMarkdownBold(String(text))).trim();
 }
 
 function stripMarkdownBold(text) {
@@ -2005,9 +2044,71 @@ function isIdentityQuestion(text) {
 
 function isMbtiQuestion(text) {
   if (!text) return false;
-  const compact = text.replace(/\s+/g, '').toLowerCase();
-  return /(你是什么mbti|你是啥mbti|你的mbti是什么|你什么人格|你是哪种人格|你是什么人格|你的人格是啥|你的人格是什么)/iu.test(compact);
+  const compact = String(text).replace(/\s+/g, '').toLowerCase();
+  const chinesePhrases = [
+    '\u4f60\u662f\u4ec0\u4e48mbti',
+    '\u4f60\u662f\u5565mbti',
+    '\u4f60\u7684mbti\u662f\u4ec0\u4e48',
+    '\u4f60\u4ec0\u4e48\u4eba\u683c',
+    '\u4f60\u662f\u54ea\u79cd\u4eba\u683c',
+    '\u4f60\u662f\u4ec0\u4e48\u4eba\u683c',
+    '\u4f60\u7684\u4eba\u683c\u662f\u5565',
+    '\u4f60\u7684\u4eba\u683c\u662f\u4ec0\u4e48',
+  ];
+  if (chinesePhrases.some((phrase) => compact.includes(phrase))) return true;
+  return /(whatisyourmbti|yourmbti|mbtitype|whatpersonalitytypeareyou)/iu.test(compact);
 }
+
+function isHardIdentityRouteQuestion(text) {
+  if (!text) return false;
+  const compact = String(text).replace(/\s+/g, '').toLowerCase();
+  if (!compact) return false;
+  const normalized = compact.replace(/[!！?？。,.，、；;:："'“”‘’（）()]/g, '');
+
+  if (/^(deepseek\u662f\u4ec0\u4e48|deepseek\u662f\u5565|deepseek\u6a21\u578b\u662f\u4ec0\u4e48|whatisdeepseek|introducedeepseek)/iu.test(normalized)) {
+    return false;
+  }
+
+  const identityQueries = new Set([
+    '\u4f60\u662f\u8c01',
+    '\u4f60\u53eb\u4ec0\u4e48',
+    '\u4f60\u53eb\u4ec0\u4e48\u540d\u5b57',
+    '\u4f60\u662f\u5565',
+    'whoareyou',
+  ]);
+  if (identityQueries.has(normalized)) return true;
+
+  const modelQueries = new Set([
+    '\u4f60\u662f\u4ec0\u4e48\u6a21\u578b',
+    '\u4ec0\u4e48\u6a21\u578b',
+    '\u4f60\u662f\u54ea\u4e2a\u6a21\u578b',
+    '\u4f60\u662f\u5565\u6a21\u578b',
+    'whatmodelareyou',
+    'areyoudeepseek',
+    'areyoudeepsick',
+    '\u4f60\u662fdeepseek\u5417',
+    '\u4f60\u662f\u4e0d\u662fdeepseek',
+    '\u4f60\u662fdeepsick\u5417',
+  ]);
+  if (modelQueries.has(normalized)) return true;
+
+  const asksModelWithYou =
+    normalized.includes('\u4ec0\u4e48\u6a21\u578b') && (normalized.includes('\u4f60') || normalized === '\u4ec0\u4e48\u6a21\u578b');
+  if (asksModelWithYou) return true;
+
+  const asksDeepseekIdentity =
+    (normalized.includes('deepseek') || normalized.includes('deepsick'))
+      && (normalized.includes('\u4f60') || normalized.includes('you') || normalized.includes('areyou'));
+  if (asksDeepseekIdentity) return true;
+
+  return false;
+}
+
+function buildHardIdentityRouteReply(payload) {
+  const profile = normalizeIdentity(payload?.identity);
+  return `\u6211\u662f${profile.companionName}\uff0c\u4e00\u4e2a\u4f1a\u5e2e\u52a9\u4f60\u6210\u957f\u3001\u5e2e\u4f60\u590d\u76d8\u7684AI\u4f19\u4f34\u3002`;
+}
+
 
 function isPraiseInput(text) {
   if (!text) return false;
@@ -2196,14 +2297,17 @@ function buildIntentReply(payload) {
 function buildFallbackReply(payload) {
   const text = typeof payload?.message === 'string' ? payload.message : '';
   const profile = normalizeIdentity(payload?.identity);
-  if (isIdentityQuestion(text)) return `我是${profile.companionName}，在这里陪你聊天。`;
+  if (isIdentityQuestion(text)) {
+    return `\u6211\u662f${profile.companionName}\uff0c\u4e00\u4e2a\u4f1a\u5e2e\u52a9\u4f60\u6210\u957f\u3001\u5e2e\u4f60\u590d\u76d8\u7684AI\u4f19\u4f34\u3002`;
+  }
   if (isMbtiQuestion(text)) {
     return profile.companionMbti
-      ? `按设定我是${profile.companionMbti}。`
-      : '你还没给我设置 MBTI。';
+      ? `\u6309\u8bbe\u5b9a\u6211\u662f${profile.companionMbti}\u3002`
+      : '\u4f60\u8fd8\u6ca1\u7ed9\u6211\u8bbe\u5b9a MBTI\u3002';
   }
-  return '我在陪你。刚刚这条回复没有完整生成，你把这句话再发一次，我会认真接住；重要信息我也会帮你记住。';
+  return '\u6211\u5728\u966a\u4f60\u3002\u521a\u521a\u8fd9\u6761\u56de\u590d\u6ca1\u6709\u5b8c\u6574\u751f\u6210\uff0c\u4f60\u628a\u8fd9\u53e5\u8bdd\u518d\u53d1\u4e00\u6b21\uff0c\u6211\u4f1a\u8ba4\u771f\u63a5\u4f4f\uff1b\u91cd\u8981\u4fe1\u606f\u6211\u4e5f\u4f1a\u5e2e\u4f60\u8bb0\u4f4f\u3002';
 }
+
 
 function countSentences(text) {
   return String(text || '')
@@ -2343,7 +2447,7 @@ async function expandAssistantReply(payload, model, draftReply) {
           '3) 默认不输出行动清单；只有用户明确问“怎么办/建议/方案/步骤”才给方案。',
           '4) 用户有情绪（如失恋/伤心）时，重点是陪伴和理解，避免一句话打发。',
           '5) 输出完整自然中文，不要标题，不要编号列表，不要代码块。',
-          '长度：通常 450-1200 字；如果用户文本很短且非情绪场景，也至少写到有层次。',
+          '长度按用户需要自然展开，不设固定字数限制。',
         ].join('\n'),
       },
       {
@@ -2389,7 +2493,8 @@ async function expandAssistantReply(payload, model, draftReply) {
   }
 
   const choice = data?.choices?.[0];
-  return normalizeAssistantText(choice?.message?.content, payload);
+  const normalized = normalizeAssistantText(choice?.message?.content, payload);
+  return sanitizeAssistantReply(normalized);
 }
 
 async function regenerateDistressReply(payload, model, rejectedReply) {
@@ -2406,7 +2511,7 @@ async function regenerateDistressReply(payload, model, rejectedReply) {
           '2) 先共情承接，再分析用户在意的点；不要说教，不要爹味。',
           '3) 默认不给行动清单；仅当用户明确问“怎么办/建议/方案/步骤”时，才给方案。',
           '4) 不要出现“先说结论：”、标题、编号列表、代码块。',
-          '5) 输出自然中文，长度 260-900 字。',
+          '5) 输出自然中文，长度按用户需要自然展开，不设固定字数限制。',
         ].join('\n'),
       },
       {
@@ -2452,7 +2557,8 @@ async function regenerateDistressReply(payload, model, rejectedReply) {
   }
 
   const choice = data?.choices?.[0];
-  return normalizeAssistantText(choice?.message?.content, payload);
+  const normalized = normalizeAssistantText(choice?.message?.content, payload);
+  return sanitizeAssistantReply(normalized);
 }
 
 async function callModelWithFailover(payload) {
@@ -2466,6 +2572,7 @@ async function callModelWithFailover(payload) {
 
 function buildMessages(payload) {
   const userText = typeof payload.message === 'string' ? payload.message.trim() : '';
+  const systemPrompt = buildSystemPrompt(payload.identity);
   const recentDialogue = buildRecentDialogueMessages(payload);
   const attachRecapContext = shouldAttachRecapContext(userText);
   const recapContextText = attachRecapContext ? buildRecapContextText(payload) : '';
@@ -2473,6 +2580,7 @@ function buildMessages(payload) {
 
   if (!payload.imageDataUrl) {
     return [
+      ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
       ...(recapContextText ? [{ role: 'user', content: recapContextText }] : []),
       ...(memoryHintText ? [{ role: 'user', content: memoryHintText }] : []),
       ...recentDialogue,
@@ -2481,6 +2589,7 @@ function buildMessages(payload) {
   }
 
   return [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
     ...(recapContextText ? [{ role: 'user', content: recapContextText }] : []),
     ...(memoryHintText ? [{ role: 'user', content: memoryHintText }] : []),
     ...recentDialogue,
@@ -2543,9 +2652,7 @@ async function chatWithDeepSeek(payload) {
   const choice = data?.choices?.[0];
   const assistantText = normalizeAssistantText(choice?.message?.content, payload);
   const rawReply = assistantText || '我在，继续说。';
-  // 过滤掉厂商名称，防止AI暴露身份
-  // 去除 Markdown 粗体格式
-  const finalReply = stripMarkdownBold(stripProviderIdentity(rawReply));
+  const finalReply = sanitizeAssistantReply(rawReply);
 
   return {
     reply: finalReply,
@@ -2641,7 +2748,8 @@ async function saveUserMessage(pb, userId, message, model, imageDataUrl, sequenc
 }
 
 async function saveAssistantMessage(pb, userId, message, model, sequence = null) {
-  const storedText = encodeStoredChatText(message, sequence);
+  const safeMessage = sanitizeAssistantReply(message) || '\u6211\u5728\uff0c\u7ee7\u7eed\u8bf4\u3002';
+  const storedText = encodeStoredChatText(safeMessage, sequence);
   const strictPayload = {
     user: userId,
     role: 'assistant',
@@ -3490,7 +3598,20 @@ app.post('/api/chat', async (req, res) => {
     if (imageDataUrl && !imageDataUrl.startsWith('data:image/')) {
       return sendApiError(req, res, 400, 'imageDataUrl must be data:image/* base64', 'VALIDATION_IMAGE_DATA_URL');
     }
-    const directReply = '';
+    const directReply = isHardIdentityRouteQuestion(message)
+      ? (
+        sanitizeAssistantReply(
+          buildHardIdentityRouteReply({
+            message,
+            identity: payload.identity || null,
+          }),
+        )
+          || buildFallbackReply({
+            message,
+            identity: payload.identity || null,
+          })
+      )
+      : '';
     if (directReply) {
       const persistStarted = Date.now();
       const persisted = await persistChatWithTimeout(auth, message, imageDataUrl, {
@@ -3516,7 +3637,6 @@ app.post('/api/chat', async (req, res) => {
         persisted,
       });
     }
-
     const allowLongTermMemory = shouldInjectLongTermMemory(message);
 
     const contextStarted = Date.now();
@@ -3563,10 +3683,14 @@ app.post('/api/chat', async (req, res) => {
     };
     const modelStarted = Date.now();
     const modelResult = await callModelWithFailover(payloadForModel);
+    const safeModelResult = {
+      ...modelResult,
+      reply: sanitizeAssistantReply(modelResult?.reply || '') || buildFallbackReply(payloadForModel),
+    };
     checkpoint('modelMs', modelStarted);
 
     const persistStarted = Date.now();
-    const persisted = await persistChatWithTimeout(auth, message, imageDataUrl, modelResult);
+    const persisted = await persistChatWithTimeout(auth, message, imageDataUrl, safeModelResult);
     checkpoint('persistMs', persistStarted);
     checkpoint('totalMs', startedAt);
 
@@ -3579,9 +3703,9 @@ app.post('/api/chat', async (req, res) => {
     }
 
     const responseBody = {
-      reply: modelResult.reply,
-      model: modelResult.model,
-      usage: modelResult.usage,
+      reply: safeModelResult.reply,
+      model: safeModelResult.model,
+      usage: safeModelResult.usage,
       persisted,
     };
     if (shouldDebugTimings) {
