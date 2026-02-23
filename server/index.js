@@ -1,4 +1,4 @@
-const fs = require('fs');
+﻿const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
@@ -54,6 +54,7 @@ const PB_URL = (process.env.POCKETBASE_URL_NEW || '').trim();
 const PB_USERS_COLLECTION = (process.env.POCKETBASE_USERS_COLLECTION || 'users').trim();
 const PB_CHAT_COLLECTION = (process.env.POCKETBASE_CHAT_COLLECTION || 'growup_chat_messages').trim();
 const PB_MEMORIES_COLLECTION = (process.env.POCKETBASE_MEMORIES_COLLECTION || 'growup_memories').trim();
+const PB_RECAPS_COLLECTION = (process.env.POCKETBASE_RECAPS_COLLECTION || 'growup_recaps').trim();
 const PB_USER_APPS_COLLECTION = (process.env.POCKETBASE_USER_APPS_COLLECTION || 'user_apps').trim();
 const PB_APP_ID = (process.env.POCKETBASE_APP_ID || 'mobile').trim();
 const PB_APP_ID_WHITELIST = Array.from(
@@ -71,6 +72,7 @@ const STATE_PREFIX = '__app_state__::';
 const STATE_MODEL = 'state-v1';
 const MEMORY_KIND_IDENTITY = 'identity-v1';
 const MEMORY_KIND_STATE = 'state-v1';
+const RECAP_KIND = 'recap-v1';
 const CHAT_SEQ_PREFIX = '__chat_seq__:';
 
 let vectorCollectionReady = false;
@@ -1029,11 +1031,15 @@ function buildRecapMemoriesFromState(state, queryText, limit = 2) {
   const askForRecap = /复盘|总结|回顾|上次|之前|记得|提过|说过|怎么了|怎么回事|时间线/u.test(query);
   if (tokens.length === 0 && !askForRecap) return [];
 
-  const dayRecaps = state.recaps
-    .filter((item) => item && item.period === 'day')
-    .sort((a, b) => String(b.endDate || '').localeCompare(String(a.endDate || '')));
+  const recaps = normalizeRecapRecordsList(state.recaps, 360);
+  const periodWeight = {
+    day: 1.15,
+    week: 1.05,
+    month: 0.95,
+    year: 0.9,
+  };
 
-  const scored = dayRecaps
+  const scored = recaps
     .map((item, index) => {
       const summary = sanitizeMemoryText(String(item.summary || ''));
       const highlights = Array.isArray(item.highlights)
@@ -1056,24 +1062,34 @@ function buildRecapMemoriesFromState(state, queryText, limit = 2) {
         score = 0.6;
       }
 
-      return { item, summary, highlights, actions, score };
+      const period = String(item.period || '').trim();
+      score *= Number(periodWeight[period] || 1);
+      return { item, period, summary, highlights, actions, score };
     })
     .filter((item) => item.score > 0)
     .sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       return String(b.item.endDate || '').localeCompare(String(a.item.endDate || ''));
     })
-    .slice(0, Math.max(1, Math.min(limit, 4)));
+    .slice(0, Math.max(1, Math.min(limit, 6)));
 
   const memories = [];
   for (const row of scored) {
     const label = String(row.item.label || row.item.endDate || '').trim();
-    if (row.summary) memories.push(`日复盘(${label || '最近一天'})：${row.summary.slice(0, 140)}`);
-    if (row.highlights[0]) memories.push(`日亮点(${label || '最近一天'})：${row.highlights[0].slice(0, 100)}`);
-    if (row.actions[0]) memories.push(`日行动(${label || '最近一天'})：${row.actions[0].slice(0, 100)}`);
+    const periodLabel = row.period === 'day'
+      ? '日'
+      : row.period === 'week'
+        ? '周'
+        : row.period === 'month'
+          ? '月'
+          : '年';
+
+    if (row.summary) memories.push(`${periodLabel}复盘(${label || '最近记录'})：${row.summary.slice(0, 140)}`);
+    if (row.highlights[0]) memories.push(`${periodLabel}亮点(${label || '最近记录'})：${row.highlights[0].slice(0, 100)}`);
+    if (row.actions[0]) memories.push(`${periodLabel}行动(${label || '最近记录'})：${row.actions[0].slice(0, 100)}`);
   }
 
-  return memories.slice(0, 6);
+  return memories.slice(0, 9);
 }
 
 async function persistChatWithTimeout(auth, message, imageDataUrl, modelResult) {
@@ -1320,9 +1336,72 @@ function normalizeStatePayload(state) {
     journals: Array.isArray(source.journals) ? source.journals.slice(-240) : [],
     tasks: Array.isArray(source.tasks) ? source.tasks.slice(-400) : [],
     digests: Array.isArray(source.digests) ? source.digests.slice(-120) : [],
-    recaps: Array.isArray(source.recaps) ? source.recaps.slice(-320) : [],
+    recaps: normalizeRecapRecordsList(Array.isArray(source.recaps) ? source.recaps : [], 320),
     lastRolloverDate: typeof source.lastRolloverDate === 'string' ? source.lastRolloverDate : '',
   };
+}
+
+function normalizeRecapStringList(value, limit = 8) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .filter((item, index, arr) => arr.indexOf(item) === index)
+    .slice(0, limit);
+}
+
+function normalizeRecapRecordInput(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const period = String(source.period || '').trim();
+  const label = String(source.label || '').trim();
+  const startDate = String(source.startDate || '').trim();
+  const endDate = String(source.endDate || '').trim();
+  if (!period || !label || !startDate || !endDate) return null;
+  if (!['day', 'week', 'month', 'year'].includes(period)) return null;
+
+  return {
+    id: String(source.id || `recap-${period}-${label}`).trim() || `recap-${period}-${label}`,
+    period,
+    label,
+    startDate,
+    endDate,
+    summary: String(source.summary || '').replace(/\s+/g, ' ').trim().slice(0, 1600),
+    highlights: normalizeRecapStringList(source.highlights, 6),
+    lowlights: normalizeRecapStringList(source.lowlights, 6),
+    actions: normalizeRecapStringList(source.actions, 6),
+    milestones: normalizeRecapStringList(source.milestones, 4),
+    growths: normalizeRecapStringList(source.growths, 4),
+    createdAt: String(source.createdAt || '').trim() || new Date().toISOString(),
+  };
+}
+
+function recapRecordKey(item) {
+  return `${String(item?.period || '').trim()}:${String(item?.label || '').trim()}`;
+}
+
+function normalizeRecapRecordsList(items, limit = 360) {
+  const source = Array.isArray(items) ? items : [];
+  const map = new Map();
+  for (const raw of source) {
+    const normalized = normalizeRecapRecordInput(raw);
+    if (!normalized) continue;
+    const key = recapRecordKey(normalized);
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, normalized);
+      continue;
+    }
+
+    const existingTs = Date.parse(String(existing.createdAt || existing.endDate || ''));
+    const nextTs = Date.parse(String(normalized.createdAt || normalized.endDate || ''));
+    if (!Number.isFinite(existingTs) || (Number.isFinite(nextTs) && nextTs >= existingTs)) {
+      map.set(key, normalized);
+    }
+  }
+
+  return Array.from(map.values())
+    .sort((a, b) => String(b.endDate || '').localeCompare(String(a.endDate || '')))
+    .slice(0, Math.max(1, limit));
 }
 
 function stateToText(state) {
@@ -1463,6 +1542,202 @@ async function findMemoryRecord(pb, userId, kind) {
   return null;
 }
 
+function recapPayloadFromRecord(record) {
+  if (!record || typeof record !== 'object') return null;
+
+  const fromFields = normalizeRecapRecordInput({
+    id: record.id,
+    period: record.period,
+    label: record.label,
+    startDate: record.startDate,
+    endDate: record.endDate,
+    summary: record.summary,
+    highlights: record.highlights,
+    lowlights: record.lowlights,
+    actions: record.actions,
+    milestones: record.milestones,
+    growths: record.growths,
+    createdAt: record.created || record.updated || '',
+  });
+  if (fromFields) return fromFields;
+
+  const fallback = memoryPayloadFromRecord(record, () => null);
+  if (!fallback) return null;
+  return normalizeRecapRecordInput(fallback);
+}
+
+async function listRecapRecordsFromCollection(pb, userId, limit = 320) {
+  let list = null;
+  try {
+    list = await pb.collection(PB_RECAPS_COLLECTION).getList(1, Math.max(20, Math.min(limit, 400)), {
+      filter: buildUserAppFilter(userId, true),
+      sort: '-endDate,-updated,-created',
+    });
+  } catch (error) {
+    if (isMissingCollectionError(error)) return [];
+    if (!isFilterFieldError(error)) throw error;
+    list = await pb.collection(PB_RECAPS_COLLECTION).getList(1, Math.max(20, Math.min(limit, 400)), {
+      filter: buildUserAppFilter(userId, false),
+      sort: '-endDate,-updated,-created',
+    });
+  }
+
+  const items = Array.isArray(list?.items) ? list.items : [];
+  return normalizeRecapRecordsList(items.map((item) => recapPayloadFromRecord(item)).filter(Boolean), limit);
+}
+
+async function findRecapRecord(pb, userId, recap) {
+  const period = String(recap?.period || '').trim();
+  const label = String(recap?.label || '').trim();
+  if (!period || !label) return null;
+
+  const baseFilter = `period = "${escapeFilterValue(period)}" && label = "${escapeFilterValue(label)}"`;
+  try {
+    return await pb.collection(PB_RECAPS_COLLECTION).getFirstListItem(`${buildUserAppFilter(userId, true)} && ${baseFilter}`);
+  } catch (error) {
+    if (isMissingCollectionError(error)) return null;
+    if (!isFilterFieldError(error)) {
+      const status = Number(error?.status || error?.response?.status || 0);
+      if (status !== 404) throw error;
+      return null;
+    }
+  }
+
+  try {
+    return await pb.collection(PB_RECAPS_COLLECTION).getFirstListItem(`${buildUserAppFilter(userId, false)} && ${baseFilter}`);
+  } catch (error) {
+    const status = Number(error?.status || error?.response?.status || 0);
+    if (status === 404 || isMissingCollectionError(error)) return null;
+    throw error;
+  }
+}
+
+function buildRecapCreatePayloadCandidates(userId, recap) {
+  const normalized = normalizeRecapRecordInput(recap);
+  if (!normalized) return [];
+  const audit = buildAuditCreateFields(userId);
+  const raw = JSON.stringify(normalized);
+
+  return [
+    {
+      user: userId,
+      appId: PB_APP_ID,
+      kind: RECAP_KIND,
+      period: normalized.period,
+      label: normalized.label,
+      startDate: normalized.startDate,
+      endDate: normalized.endDate,
+      summary: normalized.summary,
+      highlights: normalized.highlights,
+      lowlights: normalized.lowlights,
+      actions: normalized.actions,
+      milestones: normalized.milestones,
+      growths: normalized.growths,
+      content: raw,
+      ...audit,
+    },
+    {
+      user: userId,
+      appId: PB_APP_ID,
+      kind: RECAP_KIND,
+      period: normalized.period,
+      label: normalized.label,
+      content: raw,
+      ...audit,
+    },
+    {
+      user: userId,
+      kind: RECAP_KIND,
+      period: normalized.period,
+      label: normalized.label,
+      content: raw,
+      ...audit,
+    },
+  ];
+}
+
+function buildRecapUpdatePayloadFromRecord(record, userId, recap) {
+  const normalized = normalizeRecapRecordInput(recap);
+  if (!normalized) return null;
+  const raw = JSON.stringify(normalized);
+  const data = {
+    ...buildAuditUpdateFields(userId),
+  };
+
+  if ('kind' in record) data.kind = RECAP_KIND;
+  if ('period' in record) data.period = normalized.period;
+  if ('label' in record) data.label = normalized.label;
+  if ('startDate' in record) data.startDate = normalized.startDate;
+  if ('endDate' in record) data.endDate = normalized.endDate;
+  if ('summary' in record) data.summary = normalized.summary;
+  if ('highlights' in record) data.highlights = normalized.highlights;
+  if ('lowlights' in record) data.lowlights = normalized.lowlights;
+  if ('actions' in record) data.actions = normalized.actions;
+  if ('milestones' in record) data.milestones = normalized.milestones;
+  if ('growths' in record) data.growths = normalized.growths;
+  if ('content' in record) data.content = raw;
+  if ('payload' in record) data.payload = raw;
+  if ('text' in record) data.text = raw;
+
+  return data;
+}
+
+async function upsertRecapRecord(pb, userId, recap) {
+  const normalized = normalizeRecapRecordInput(recap);
+  if (!normalized) return false;
+
+  let existing = null;
+  try {
+    existing = await findRecapRecord(pb, userId, normalized);
+  } catch (error) {
+    if (isMissingCollectionError(error)) return false;
+    throw error;
+  }
+
+  if (existing) {
+    const patch = buildRecapUpdatePayloadFromRecord(existing, userId, normalized);
+    if (!patch) return false;
+    try {
+      await pb.collection(PB_RECAPS_COLLECTION).update(existing.id, patch);
+      return true;
+    } catch (error) {
+      if (isMissingCollectionError(error)) return false;
+      if (!isRecoverableMemoryWriteError(error)) throw error;
+    }
+  }
+
+  const candidates = buildRecapCreatePayloadCandidates(userId, normalized);
+  for (const candidate of candidates) {
+    try {
+      if (existing) {
+        await pb.collection(PB_RECAPS_COLLECTION).update(existing.id, candidate);
+      } else {
+        await pb.collection(PB_RECAPS_COLLECTION).create(candidate);
+      }
+      return true;
+    } catch (error) {
+      if (isMissingCollectionError(error)) return false;
+      if (!isRecoverableMemoryWriteError(error)) throw error;
+    }
+  }
+
+  return false;
+}
+
+async function saveRecapRecords(pb, userId, recaps) {
+  const normalized = normalizeRecapRecordsList(recaps, 360);
+  if (normalized.length === 0) return false;
+
+  let wroteAny = false;
+  for (const recap of normalized) {
+    // Keep writes resilient: recap storage should never block chat/state path.
+    // eslint-disable-next-line no-await-in-loop
+    const saved = await upsertRecapRecord(pb, userId, recap).catch(() => false);
+    wroteAny = wroteAny || saved;
+  }
+  return wroteAny;
+}
+
 async function readIdentityFromMemories(pb, userId) {
   const record = await findMemoryRecord(pb, userId, MEMORY_KIND_IDENTITY);
   if (!record) return null;
@@ -1489,10 +1764,22 @@ async function readIdentity(pb, userId) {
 
 async function readState(pb, userId) {
   const fromMemories = await readStateFromMemories(pb, userId);
-  if (fromMemories) return fromMemories;
+  const legacy = fromMemories ? null : await findLegacyStateRecord(pb, userId);
+  const baseState = normalizeStatePayload(fromMemories || (legacy ? textToState(legacy.text) : null) || {});
 
-  const legacy = await findLegacyStateRecord(pb, userId);
-  return legacy ? textToState(legacy.text) : null;
+  try {
+    const recapRecords = await listRecapRecordsFromCollection(pb, userId, 320);
+    if (recapRecords.length === 0) return baseState;
+    return {
+      ...baseState,
+      recaps: normalizeRecapRecordsList([...(baseState.recaps || []), ...recapRecords], 320),
+    };
+  } catch (error) {
+    if (!isMissingCollectionError(error)) {
+      console.warn(`[recap] read recap collection failed: ${error?.message || 'unknown error'}`);
+    }
+    return baseState;
+  }
 }
 
 function buildMemoryCreatePayloadCandidates(userId, kind, payload) {
@@ -1626,8 +1913,16 @@ async function saveIdentity(pb, userId, identity) {
 async function saveState(pb, userId, state) {
   const normalized = normalizeStatePayload(state);
   const saved = await upsertMemoryRecord(pb, userId, MEMORY_KIND_STATE, normalized);
-  if (saved) return;
-  await saveLegacyState(pb, userId, normalized);
+  if (!saved) {
+    await saveLegacyState(pb, userId, normalized);
+  }
+  try {
+    await saveRecapRecords(pb, userId, normalized.recaps);
+  } catch (error) {
+    if (!isMissingCollectionError(error)) {
+      console.warn(`[recap] save recap collection failed: ${error?.message || 'unknown error'}`);
+    }
+  }
 }
 
 function mapMemoryRecord(record) {
@@ -1904,27 +2199,61 @@ function buildMemoryHintText(payload) {
   return lines.join('\n').trim();
 }
 
+function selectRelevantRecapRecords(recaps, userText, limit = 12) {
+  const normalized = normalizeRecapRecordsList(recaps, 360);
+  if (normalized.length === 0) return [];
+
+  const query = normalizeTextForVector(userText || '');
+  const tokens = query
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_]+/u)
+    .filter((token) => token.length >= 2)
+    .slice(0, 8);
+  const askForRecap = /复盘|总结|回顾|上次|之前|记得|提过|说过|时间线|回看|归纳/u.test(query);
+  const periodWeight = { day: 1.15, week: 1.05, month: 0.95, year: 0.9 };
+
+  const scored = normalized
+    .map((item, index) => {
+      const summary = String(item.summary || '').replace(/\s+/g, ' ').trim();
+      const highlights = Array.isArray(item.highlights)
+        ? item.highlights.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 3)
+        : [];
+      const actions = Array.isArray(item.actions)
+        ? item.actions.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 3)
+        : [];
+      const corpus = [summary, ...highlights, ...actions].join(' ').toLowerCase();
+
+      let hitScore = 0;
+      for (const token of tokens) {
+        if (corpus.includes(token)) hitScore += 1;
+      }
+      const recencyBonus = Math.max(0, 12 - index) / 12;
+      const periodBonus = Number(periodWeight[String(item.period || '').trim()] || 1);
+      const recapIntentBonus = askForRecap ? 0.6 : 0;
+      const score = (hitScore + recencyBonus + recapIntentBonus) * periodBonus;
+      return { item, summary, highlights, actions, score };
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return String(b.item.endDate || '').localeCompare(String(a.item.endDate || ''));
+    })
+    .slice(0, Math.max(1, Math.min(limit, 20)));
+
+  return scored.map((row) => ({
+    period: row.item.period,
+    label: row.item.label,
+    summary: row.summary,
+    highlights: row.highlights,
+    actions: row.actions,
+  }));
+}
+
 function buildRecapContextText(payload) {
   const recaps = Array.isArray(payload?.recapRecords) ? payload.recapRecords : [];
   if (recaps.length === 0) return '';
-
-  const lines = recaps
-    .slice(0, 120)
-    .map((item) => {
-      const period = String(item?.period || '').trim();
-      const label = String(item?.label || '').trim();
-      const summary = String(item?.summary || '').replace(/\s+/g, ' ').trim();
-      const highlights = Array.isArray(item?.highlights)
-        ? item.highlights.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 3)
-        : [];
-      const actions = Array.isArray(item?.actions)
-        ? item.actions.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 3)
-        : [];
-      if (!period || !label || !summary) return '';
-      return JSON.stringify({ period, label, summary, highlights, actions });
-    })
-    .filter(Boolean);
-
+  const selected = selectRelevantRecapRecords(recaps, payload?.message || '', 12);
+  if (selected.length === 0) return '';
+  const lines = selected.map((item) => JSON.stringify(item));
   if (lines.length === 0) return '';
   return `以下是用户历史复盘记录（JSONL，每行一条，可按需参考）：\n${lines.join('\n')}`;
 }
@@ -1937,10 +2266,14 @@ function buildRecentDialogueMessages(payload) {
   }));
 }
 
-function shouldAttachRecapContext(userText) {
+function shouldAttachRecapContext(userText, recapRecords = []) {
   const text = normalizeTextForVector(userText || '');
   if (!text) return false;
-  return /(复盘|总结|回顾|梳理|历史记录|之前聊过|上次聊到|回看|归纳)/u.test(text);
+  if (!Array.isArray(recapRecords) || recapRecords.length === 0) {
+    return /(复盘|总结|回顾|梳理|历史记录|之前聊过|上次聊到|回看|归纳)/u.test(text);
+  }
+  if (isSmallTalkPing(text)) return false;
+  return true;
 }
 
 function normalizeAssistantText(content, payload) {
@@ -2574,7 +2907,7 @@ function buildMessages(payload) {
   const userText = typeof payload.message === 'string' ? payload.message.trim() : '';
   const systemPrompt = buildSystemPrompt(payload.identity);
   const recentDialogue = buildRecentDialogueMessages(payload);
-  const attachRecapContext = shouldAttachRecapContext(userText);
+  const attachRecapContext = shouldAttachRecapContext(userText, payload.recapRecords);
   const recapContextText = attachRecapContext ? buildRecapContextText(payload) : '';
   const memoryHintText = attachRecapContext ? buildMemoryHintText(payload) : '';
 
@@ -2926,6 +3259,7 @@ app.get('/api/health', (_req, res) => {
       usersCollection: PB_USERS_COLLECTION,
       chatCollection: PB_CHAT_COLLECTION,
       memoriesCollection: PB_MEMORIES_COLLECTION,
+      recapsCollection: PB_RECAPS_COLLECTION,
       userAppsCollection: PB_USER_APPS_COLLECTION,
       appId: PB_APP_ID,
     },
@@ -3404,6 +3738,50 @@ app.post('/api/context/reset', async (req, res) => {
       }
     }
 
+    let recapDeleted = 0;
+    try {
+      let recapPage = 1;
+      for (let guard = 0; guard < 30; guard += 1) {
+        let list = null;
+        try {
+          list = await withTimeout(
+            auth.pb.collection(PB_RECAPS_COLLECTION).getList(recapPage, 200, {
+              filter: buildUserAppFilter(auth.user.id, true),
+            }),
+            POCKETBASE_TIMEOUT_MS,
+            'context reset list recaps with appId',
+          );
+        } catch (error) {
+          if (!isFilterFieldError(error)) throw error;
+          list = await withTimeout(
+            auth.pb.collection(PB_RECAPS_COLLECTION).getList(recapPage, 200, {
+              filter: buildUserAppFilter(auth.user.id, false),
+            }),
+            POCKETBASE_TIMEOUT_MS,
+            'context reset list recaps fallback',
+          );
+        }
+
+        const items = Array.isArray(list?.items) ? list.items : [];
+        for (const item of items) {
+          await withTimeout(
+            auth.pb.collection(PB_RECAPS_COLLECTION).delete(item.id),
+            POCKETBASE_TIMEOUT_MS,
+            'context reset delete recap',
+          );
+          recapDeleted += 1;
+        }
+
+        const totalPages = Number(list?.totalPages || 1);
+        if (recapPage >= totalPages) break;
+        recapPage += 1;
+      }
+    } catch (error) {
+      if (!isMissingCollectionError(error)) {
+        throw error;
+      }
+    }
+
     const emptyState = normalizeStatePayload({});
     await saveState(auth.pb, auth.user.id, emptyState);
     const vectorCleared = await clearVectorMemoriesForUser(auth.user.id);
@@ -3411,6 +3789,7 @@ app.post('/api/context/reset', async (req, res) => {
     return res.json({
       chatDeleted,
       memoryDeleted,
+      recapDeleted,
       vectorCleared,
       stateReset: true,
     });
@@ -3497,6 +3876,74 @@ app.post('/api/state', async (req, res) => {
     return res.json({ state });
   } catch (error) {
     const message = error?.response?.message || error?.message || 'state save failed';
+    return sendApiError(req, res, statusForApiError(message), message);
+  }
+});
+
+app.get('/api/recaps', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return sendApiError(req, res, 401, 'missing bearer token');
+    }
+    const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return sendApiError(req, res, 403, 'app access blocked');
+    }
+
+    const limitRaw = Number(req.query.limit || 120);
+    const limit = Number.isFinite(limitRaw) ? Math.max(20, Math.min(limitRaw, 360)) : 120;
+    const period = String(req.query.period || '').trim();
+
+    let recaps = [];
+    try {
+      recaps = await listRecapRecordsFromCollection(auth.pb, auth.user.id, limit);
+    } catch (error) {
+      if (!isMissingCollectionError(error)) throw error;
+      recaps = [];
+    }
+
+    if (recaps.length === 0) {
+      const state = await readState(auth.pb, auth.user.id);
+      recaps = normalizeRecapRecordsList(state?.recaps || [], limit);
+    }
+
+    const filtered = period && ['day', 'week', 'month', 'year'].includes(period)
+      ? recaps.filter((item) => item.period === period)
+      : recaps;
+
+    return res.json({ recaps: filtered.slice(0, limit) });
+  } catch (error) {
+    const message = error?.response?.message || error?.message || 'recaps fetch failed';
+    return sendApiError(req, res, statusForApiError(message), message);
+  }
+});
+
+app.post('/api/recaps/sync', async (req, res) => {
+  try {
+    const token = getBearerToken(req);
+    if (!token) {
+      return sendApiError(req, res, 401, 'missing bearer token');
+    }
+    const auth = await authByToken(token);
+    if (!hasAppAccess(auth)) {
+      return sendApiError(req, res, 403, 'app access blocked');
+    }
+
+    const incoming = Array.isArray(req.body?.recaps) ? req.body.recaps : [];
+    const normalized = normalizeRecapRecordsList(incoming, 360);
+    if (normalized.length === 0) {
+      return sendApiError(req, res, 400, 'recaps payload is required', 'VALIDATION_RECAPS_REQUIRED');
+    }
+
+    const persisted = await saveRecapRecords(auth.pb, auth.user.id, normalized);
+    return res.json({
+      persisted,
+      count: normalized.length,
+      recaps: normalized.slice(0, 120),
+    });
+  } catch (error) {
+    const message = error?.response?.message || error?.message || 'recaps sync failed';
     return sendApiError(req, res, statusForApiError(message), message);
   }
 });
@@ -3750,6 +4197,7 @@ if (!process.env.VERCEL) {
       usersCollection: PB_USERS_COLLECTION,
       chatCollection: PB_CHAT_COLLECTION,
       memoriesCollection: PB_MEMORIES_COLLECTION,
+      recapsCollection: PB_RECAPS_COLLECTION,
       userAppsCollection: PB_USER_APPS_COLLECTION,
       appId: PB_APP_ID,
       vectorEnabled: isVectorConfigured(),
